@@ -5,3 +5,7 @@
 
 /// A segment's file names, and the header and footer each file carries.
 pub const files = @import("segment/files.zig");
+
+/// One term's postings: documents and frequencies in blocks of 128, with
+/// a skip entry and impacts per block.
+pub const postings = @import("segment/postings.zig");

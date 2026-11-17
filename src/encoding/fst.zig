@@ -21,6 +21,7 @@
 const std = @import("std");
 const aegis = @import("aegis");
 const Allocator = std.mem.Allocator;
+const varint = @import("varint.zig");
 
 /// Bytes that are not an FST, or a walk past what they can say.
 pub const Error = error{Corrupt};
@@ -143,11 +144,11 @@ pub const Builder = struct {
     fn compile(b: *Builder, node: *const Unfinished) Allocator.Error!u64 {
         b.scratch.clearRetainingCapacity();
         try b.scratch.append(b.gpa, @intFromBool(node.final));
-        try appendVarint(b.gpa, &b.scratch, node.final_out);
+        try varint.append(b.gpa, &b.scratch, node.final_out);
         for (node.transitions.items) |t| {
             try b.scratch.append(b.gpa, t.label);
-            try appendVarint(b.gpa, &b.scratch, t.out);
-            try appendVarint(b.gpa, &b.scratch, t.target);
+            try varint.append(b.gpa, &b.scratch, t.out);
+            try varint.append(b.gpa, &b.scratch, t.target);
         }
         const entry = try b.registry.getOrPut(b.gpa, b.scratch.items);
         if (entry.found_existing) return entry.value_ptr.*;
@@ -158,24 +159,18 @@ pub const Builder = struct {
         const address: u64 = b.bytes.items.len;
         entry.value_ptr.* = address;
         try b.bytes.append(b.gpa, if (node.final) final_flag else 0);
-        if (node.final) try appendVarint(b.gpa, &b.bytes, node.final_out);
-        try appendVarint(b.gpa, &b.bytes, node.transitions.items.len);
+        if (node.final) try varint.append(b.gpa, &b.bytes, node.final_out);
+        try varint.append(b.gpa, &b.bytes, node.transitions.items.len);
         for (node.transitions.items) |t| try b.bytes.append(b.gpa, t.label);
         for (node.transitions.items) |t| {
             aegis.assert.invariant(t.target < address, "a node is written after every node it leads to");
-            try appendVarint(b.gpa, &b.bytes, t.out);
-            try appendVarint(b.gpa, &b.bytes, address - t.target);
+            try varint.append(b.gpa, &b.bytes, t.out);
+            try varint.append(b.gpa, &b.bytes, address - t.target);
         }
         b.nodes += 1;
         return address;
     }
 };
-
-fn appendVarint(gpa: Allocator, out: *std.ArrayList(u8), value: u64) Allocator.Error!void {
-    var v = value;
-    while (v >= 0x80) : (v >>= 7) try out.append(gpa, @as(u8, @truncate(v)) | 0x80);
-    try out.append(gpa, @truncate(v));
-}
 
 /// An FST read from bytes, borrowing them.
 pub const Fst = struct {
@@ -222,8 +217,8 @@ pub const Fst = struct {
         at += 1;
         if (flags & ~final_flag != 0) return error.Corrupt;
         const final = flags & final_flag != 0;
-        const final_out = if (final) try readVarint(f.nodes, &at) else 0;
-        const count = try readVarint(f.nodes, &at);
+        const final_out = if (final) try varint.read(f.nodes, &at) else 0;
+        const count = try varint.read(f.nodes, &at);
         if (count > max_transitions or count > f.nodes.len - at) return error.Corrupt;
         const labels = f.nodes[at..][0..@intCast(count)];
         var i: usize = 1;
@@ -233,8 +228,8 @@ pub const Fst = struct {
 
     /// The transition at `at.*` of the node at `address`, `at` moved past it.
     fn pairAt(f: Fst, at: *usize, address: u64) Error!Pair {
-        const out = try readVarint(f.nodes, at);
-        const back = try readVarint(f.nodes, at);
+        const out = try varint.read(f.nodes, at);
+        const back = try varint.read(f.nodes, at);
         if (back == 0 or back > address) return error.Corrupt;
         return .{ .out = out, .target = address - back };
     }
@@ -309,18 +304,3 @@ pub const Fst = struct {
         }
     };
 };
-
-fn readVarint(bytes: []const u8, at: *usize) Error!u64 {
-    var value: u64 = 0;
-    var shift: u7 = 0;
-    while (true) {
-        if (at.* >= bytes.len or shift > 63) return error.Corrupt;
-        const byte = bytes[at.*];
-        at.* += 1;
-        const part: u64 = byte & 0x7f;
-        if (shift == 63 and part > 1) return error.Corrupt;
-        value |= part << @intCast(shift);
-        if (byte & 0x80 == 0) return value;
-        shift += 7;
-    }
-}
