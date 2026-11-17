@@ -15,6 +15,11 @@
 //!   them, before any is read), into the set of their documents.
 //! - A range passes a column block whose least and greatest value lie
 //!   outside it whole.
+//! - A disjunction at the root runs block-max WAND for the best hits:
+//!   a block of postings whose bound from its impacts, with the bounds of
+//!   the other clauses there, cannot pass the worst hit held is passed
+//!   unscored (`wand.zig`; the bounds are never below a score, so the hits
+//!   are the ones every document scored would give).
 //!
 //! Hits are ordered by score, highest first, and equal scores by their
 //! place in the snapshot: segment, then document. Deleted documents are
@@ -29,6 +34,7 @@ const std = @import("std");
 const aegis = @import("aegis");
 const Tree = @import("Tree.zig");
 const phrase = @import("phrase.zig");
+const wand = @import("wand.zig");
 const bm25 = @import("../bm25.zig");
 const Schema = @import("../Schema.zig");
 const Limits = @import("../Limits.zig");
@@ -66,6 +72,18 @@ pub const Options = struct {
     /// The most hits to give, at least 1.
     top: u32 = 10,
     limits: Limits = .{},
+    /// Whether a disjunction at the root runs block-max WAND; else every
+    /// document it matches is scored.
+    wand: bool = true,
+    /// Told what the search did.
+    report: ?*Report = null,
+};
+
+/// What a search did: the documents it scored, and the stretches of
+/// documents block-max WAND passed without scoring.
+pub const Report = struct {
+    scored: u64 = 0,
+    skipped: u64 = 0,
 };
 
 /// The `options.top` best hits of `root` in `snapshot`, best first, which
@@ -78,19 +96,98 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
     var run: Run = try .init(arena.allocator(), io, snapshot, root, options.limits);
     var best: Best = .{ .gpa = gpa, .top = options.top };
     defer best.deinit();
+    var report: Report = .{};
+    defer if (options.report) |r| {
+        r.* = report;
+    };
     for (snapshot.segments, 0..) |*s, place| {
         var it = try run.compile(s);
         defer run.reset();
+        if (options.wand and it.kind == .@"or") {
+            try wandSegment(&run, &best, &report, @intCast(place), s, it.kind.@"or");
+            continue;
+        }
         var doc: u32 = 0;
         while (true) : (doc += 1) {
             doc = try it.seek(doc);
             if (doc == done) break;
             try run.collected();
             if (s.isDeleted(doc)) continue;
+            report.scored += 1;
             try best.add(.{ .segment = @intCast(place), .doc = doc, .score = try it.score() });
         }
     }
     return best.finish();
+}
+
+/// A disjunction's best hits in one segment by block-max WAND (Ding and
+/// Suel). Its children are kept in order of the document each stands on.
+/// Once `best` is full, a document must score above the worst hit held to
+/// enter it: one that only ties it comes later in the snapshot than every
+/// hit held, so it ranks after them. The pivot is the first child at which
+/// the children's bounds anywhere, summed in that order, pass the
+/// threshold: no document before it can. Then the bounds of the blocks
+/// holding the pivot's document, of every child on it or before it,
+/// summed: when they do not pass the threshold, no document up to the
+/// first block's end (or the next child's document) can, and those
+/// children move past it unscored. Otherwise the children before the pivot
+/// move to its document, and once all stand on it, it is scored.
+fn wandSegment(run: *Run, best: *Best, report: *Report, place: u32, s: *const Reader.Segment, children: []Iter) Error!void {
+    const n = children.len;
+    const order = try run.segment_arena.allocator().alloc(usize, n);
+    for (order, children, 0..) |*o, *c, i| {
+        o.* = i;
+        _ = try c.seek(0);
+    }
+    while (true) {
+        // By document: few children, nearly in order each time.
+        std.sort.insertion(usize, order, children, struct {
+            fn lessThan(its: []Iter, a: usize, b: usize) bool {
+                return its[a].doc.? < its[b].doc.?;
+            }
+        }.lessThan);
+        const threshold = best.threshold();
+        var anywhere: f64 = 0;
+        const pivot: usize = for (order, 0..) |c, i| {
+            if (children[c].doc.? == done) return;
+            anywhere += children[c].bound();
+            if (threshold == null or wand.sum(anywhere, n) > @as(f64, threshold.?)) break i;
+        } else return;
+        const doc = children[order[pivot]].doc.?;
+        // Every child standing on the pivot's document is with it.
+        var end = pivot + 1;
+        while (end < n and children[order[end]].doc.? == doc) end += 1;
+        if (threshold) |t| {
+            var bound: f64 = 0;
+            var next: u64 = if (end < n) children[order[end]].doc.? else done;
+            for (order[0..end]) |c| {
+                const b = try children[c].blockBound(doc);
+                bound += b.bound;
+                next = @min(next, @as(u64, b.last) + 1);
+            }
+            if (wand.sum(bound, n) <= @as(f64, t)) {
+                report.skipped += 1;
+                const target: u32 = @intCast(@min(next, done));
+                for (order[0..end]) |c| _ = try children[c].seek(target);
+                continue;
+            }
+        }
+        if (children[order[0]].doc.? != doc) {
+            for (order[0..pivot]) |c| _ = try children[c].seek(doc);
+            continue;
+        }
+        try run.collected();
+        if (!s.isDeleted(doc)) {
+            report.scored += 1;
+            // The sum in the query's order, as the disjunction scores it.
+            var score: f32 = 0;
+            for (children) |*c| if (c.doc.? == doc) {
+                score += try c.score();
+            };
+            try best.add(.{ .segment = place, .doc = doc, .score = score });
+        }
+        for (order[0..end]) |c| _ = try children[c].seek(doc + 1);
+    }
 }
 
 /// How many live documents of `snapshot` match `root`.
@@ -124,6 +221,11 @@ const Best = struct {
 
     fn deinit(b: *Best) void {
         b.heap.deinit(b.gpa);
+    }
+
+    /// The score a hit must pass to enter, once full: the worst held.
+    fn threshold(b: *const Best) ?f32 {
+        return if (b.heap.items.len == b.top) b.heap.items[0].score else null;
     }
 
     fn add(b: *Best, hit: Hit) Allocator.Error!void {
@@ -373,6 +475,34 @@ const Iter = struct {
         };
     }
 
+    /// The most it scores any document, raised past rounding (`wand.zig`).
+    fn bound(it: *const Iter) f64 {
+        return switch (it.kind) {
+            .term => |t| wand.anywhere(t.weight),
+            .phrase => |p| wand.anywhere(p.weight),
+            // Exactly 1 in `f32`.
+            .set, .range, .all, .not => 1,
+            .none => 0,
+            .@"and" => |a| if (a.positive.len == 0) 1 else boundOf(a.positive),
+            .@"or" => |children| boundOf(children),
+            .boost => |b| wand.boost(b.child.bound(), b.by),
+        };
+    }
+
+    /// The most it scores a document from `target` to the returned `last`,
+    /// raised past rounding: a term's from the impacts of its block holding
+    /// `target`, any other's its bound anywhere.
+    fn blockBound(it: *Iter, target: u32) Error!Block {
+        return switch (it.kind) {
+            .term => |t| t.blockBound(target),
+            .boost => |b| {
+                const c = try b.child.blockBound(target);
+                return .{ .bound = wand.boost(c.bound, b.by), .last = c.last };
+            },
+            else => .{ .bound = it.bound(), .last = done - 1 },
+        };
+    }
+
     /// About how many documents it matches: what a conjunction leads by.
     fn cost(it: *const Iter) u64 {
         return switch (it.kind) {
@@ -393,6 +523,19 @@ const Iter = struct {
         };
     }
 };
+
+/// A bound on the scores of the documents up to `last`.
+const Block = struct {
+    bound: f64,
+    last: u32,
+};
+
+/// The bound of a sum of `children`, in any order.
+fn boundOf(children: []const Iter) f64 {
+    var sum: f64 = 0;
+    for (children) |*c| sum += c.bound();
+    return wand.sum(sum, children.len);
+}
 
 /// A term's postings in a segment, and its positions when a phrase reads
 /// them.
@@ -433,6 +576,16 @@ const Term = struct {
 
     fn score(t: *const Term) f32 {
         return t.weight.score(@floatFromInt(t.freq), t.length());
+    }
+
+    /// The bound of its block holding the first doc at or past `target`,
+    /// reached by skip entries alone; 0 when no doc is there.
+    fn blockBound(t: *Term, target: u32) Error!Block {
+        const found = try t.reader.shallow(target);
+        try t.run.entered(t.reader.entered - t.counted);
+        t.counted = t.reader.entered;
+        if (!found) return .{ .bound = 0, .last = done - 1 };
+        return .{ .bound = wand.block(t.weight, t.reader.impacts()), .last = t.reader.blockLast() };
     }
 
     fn length(t: *const Term) u32 {

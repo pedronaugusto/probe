@@ -288,6 +288,18 @@ pub const Reader = struct {
         return try r.next();
     }
 
+    /// Moves to the block holding the first doc at or past `target` by
+    /// skip entries alone, decoding nothing, and stays where it is when its
+    /// block's last doc is there already; false when no block is. Its
+    /// `impacts` and `blockLast` are then that block's, and `advance`
+    /// decodes it when it reaches it.
+    pub fn shallow(r: *Reader, target: u32) Error!bool {
+        while (r.entered == 0 or r.last < target) {
+            if (!try r.nextBlock()) return false;
+        }
+        return true;
+    }
+
     /// The block the reader stands in, from 0; it has given a posting.
     pub fn block(r: *const Reader) u32 {
         return r.entered - 1;

@@ -41,11 +41,42 @@ pub const Doc = struct {
 pub const Snapshot = struct {
     schema: []const Schema.Field,
     docs: []const Doc,
+    /// Per field, each term's documents and the documents' total length,
+    /// counted once by `init` (deleted documents among them).
+    dfs: []const std.StringHashMapUnmanaged(u64),
+    totals: []const u64,
+
+    /// The snapshot of `docs`, its counts on `arena`.
+    pub fn init(arena: Allocator, schema: []const Schema.Field, docs: []const Doc) Allocator.Error!Snapshot {
+        const dfs = try arena.alloc(std.StringHashMapUnmanaged(u64), schema.len);
+        const totals = try arena.alloc(u64, schema.len);
+        @memset(dfs, .empty);
+        @memset(totals, 0);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (docs) |d| {
+            for (d.values, dfs, totals) |v, *counts, *sum| {
+                seen.clearRetainingCapacity();
+                switch (v) {
+                    .text => |tokens| {
+                        sum.* += tokens.len;
+                        for (tokens) |t| try seen.put(arena, t.term, {});
+                    },
+                    .keyword => |k| try seen.put(arena, k, {}),
+                    .numeric => {},
+                }
+                var it = seen.keyIterator();
+                while (it.next()) |term| {
+                    const slot = try counts.getOrPut(arena, term.*);
+                    if (!slot.found_existing) slot.value_ptr.* = 0;
+                    slot.value_ptr.* += 1;
+                }
+            }
+        }
+        return .{ .schema = schema, .docs = docs, .dfs = dfs, .totals = totals };
+    }
 
     fn total(s: Snapshot, place: u32) u64 {
-        var sum: u64 = 0;
-        for (s.docs) |d| sum += d.values[place].text.len;
-        return sum;
+        return s.totals[place];
     }
 
     fn holds(d: Doc, place: u32, bytes: []const u8) u32 {
@@ -61,9 +92,7 @@ pub const Snapshot = struct {
     }
 
     fn df(s: Snapshot, place: u32, bytes: []const u8) u64 {
-        var n: u64 = 0;
-        for (s.docs) |d| n += @intFromBool(holds(d, place, bytes) > 0);
-        return n;
+        return s.dfs[place].get(bytes) orelse 0;
     }
 
     fn length(s: Snapshot, d: Doc, place: u32) u32 {
