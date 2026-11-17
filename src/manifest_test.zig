@@ -212,7 +212,8 @@ test "a manifest is written to be read by a person" {
         \\      "positions": false,
         \\      "offsets": false,
         \\      "analysis": "words",
-        \\      "stored": true
+        \\      "stored": true,
+        \\      "signed": false
         \\    }
         \\  ],
         \\  "segments": [

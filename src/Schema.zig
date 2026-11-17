@@ -58,6 +58,9 @@ pub const Field = struct {
     offsets: bool = false,
     analysis: Analysis = .words,
     stored: bool = false,
+    /// A numeric field of `i64`s (or an aegis scalar of them), whose
+    /// column holds each with its sign bit flipped (`columnValue`).
+    signed: bool = false,
     /// Never stored: an index is opened with any.
     bm25: Bm25 = .{},
 };
@@ -99,6 +102,7 @@ fn fieldOf(comptime Doc: type, comptime name: []const u8, comptime spec: anytype
         .numeric => if (ColumnRepr(T) == void) @compileError("probe: the numeric field `" ++ name ++ "` is a u64, an i64 or an aegis scalar of either"),
     }
     var field: Field = .{ .name = name, .kind = kind };
+    if (kind == .numeric) field.signed = ColumnRepr(T) == i64;
     inline for (@typeInfo(@TypeOf(options)).@"struct".field_names) |option| {
         const value = @field(options, option);
         if (comptime std.mem.eql(u8, option, "stored")) {

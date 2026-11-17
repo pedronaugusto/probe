@@ -9,6 +9,9 @@ pub const Tree = @import("query/Tree.zig");
 /// A phrase's frequency in a document, from its terms' positions.
 pub const phrase = @import("query/phrase.zig");
 
+/// The query language for people, read into a tree.
+pub const parse = @import("query/parse.zig");
+
 /// Upper bounds on scores, for block-max WAND.
 pub const wand = @import("query/wand.zig");
 

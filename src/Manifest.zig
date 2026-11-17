@@ -49,9 +49,10 @@ pub const Field = struct {
     offsets: bool = false,
     analysis: Schema.Analysis = .words,
     stored: bool = false,
+    signed: bool = false,
 
     pub fn of(f: Schema.Field) Field {
-        return .{ .name = f.name, .kind = f.kind, .positions = f.positions, .offsets = f.offsets, .analysis = f.analysis, .stored = f.stored };
+        return .{ .name = f.name, .kind = f.kind, .positions = f.positions, .offsets = f.offsets, .analysis = f.analysis, .stored = f.stored, .signed = f.signed };
     }
 };
 
@@ -214,7 +215,7 @@ fn firstDifference(got: []const Field, want: []const Field) ?usize {
         const g = got[place];
         const w = want[place];
         if (!std.mem.eql(u8, g.name, w.name) or g.kind != w.kind or g.positions != w.positions or
-            g.offsets != w.offsets or g.analysis != w.analysis or g.stored != w.stored) return place;
+            g.offsets != w.offsets or g.analysis != w.analysis or g.stored != w.stored or g.signed != w.signed) return place;
     }
     return if (got.len == want.len) null else @min(got.len, want.len);
 }
