@@ -87,6 +87,9 @@ options: Options,
 /// holds what it closed since that commit too.
 generation: u64,
 segments: []Segment,
+/// How many times the newest manifest was read again before this one
+/// opened whole: a manifest whose files a writer removed meanwhile.
+retried: u8 = 0,
 
 /// A snapshot of the newest commit of the index in `dir`, which the caller
 /// keeps open, of documents of `schema`.
@@ -110,9 +113,13 @@ pub fn deinit(r: *Reader) void {
 const AttemptError = error{Vanished} || error{ NotFound, Corrupt, VersionTooNew, SchemaMismatch, ReadFailed, Canceled, OutOfMemory };
 
 fn openFrom(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, options: Options, previous: []const Segment) OpenError!Reader {
-    var tries: u32 = 0;
+    var tries: u8 = 0;
     while (true) {
-        if (attempt(gpa, io, dir, schema, options, previous)) |r| return r else |err| switch (err) {
+        if (attempt(gpa, io, dir, schema, options, previous)) |r| {
+            var opened = r;
+            opened.retried = tries;
+            return opened;
+        } else |err| switch (err) {
             error.Vanished => {
                 if (tries == options.retries) return error.Busy;
                 tries += 1;

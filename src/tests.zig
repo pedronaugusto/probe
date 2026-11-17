@@ -21,5 +21,6 @@ test {
     _ = @import("writer_test.zig");
     _ = @import("reader_test.zig");
     _ = @import("merge_test.zig");
+    _ = @import("concurrency_test.zig");
     _ = @import("crash_test.zig");
 }

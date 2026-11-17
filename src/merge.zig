@@ -566,12 +566,16 @@ pub const Policy = struct {
         var best_score: ?f64 = null;
         for (0..eligible.len) |start| {
             const c = p.candidate(sizes, eligible, start);
-            if (c.count == 0) continue;
-            // A rewrite of one segment is made only to reclaim deletes.
-            if (c.count == 1 and sizes[c.members[0]].deleted == 0) continue;
             // Past a full merge, shorter ones from smaller segments on
             // only score worse.
             if (best_score != null and !c.too_large and c.count < p.factor()) break;
+            // A candidate takes its first segment, and one alone is a
+            // rewrite to reclaim deletes: a segment without them under half
+            // the cap has a smaller one after it that fits, or is the last,
+            // where the merge found from an earlier start ends the walk; one
+            // over half is left alone. Probe has no forced merge, the one
+            // path that would rewrite a segment for nothing.
+            aegis.assert.invariant(c.count > 1 or (c.count == 1 and sizes[c.members[0]].deleted > 0), "a segment written again alone has deletes to reclaim");
             const score = p.scoreOf(sizes, &c);
             if (best_score == null or score < best_score.?) {
                 best = c;
