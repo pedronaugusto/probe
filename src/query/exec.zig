@@ -136,6 +136,11 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
             try wandSegment(&run, &best, &report, @intCast(place), s, it.kind.@"or");
             continue;
         }
+        if (options.wand and options.order == .score and it.kind == .@"and" and it.kind.@"and".positive.len > 0) {
+            report.pruned = true;
+            try conjunctionSegment(&run, &best, &report, @intCast(place), s, it.kind.@"and");
+            continue;
+        }
         var column: ?segment.columns.Cursor = switch (options.order) {
             .score => null,
             .column => |c| .init(s.read().column(c.field)),
@@ -156,6 +161,52 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
         }
     }
     return best.finish();
+}
+
+/// A conjunction's best hits in one segment, its blocks skipped by their
+/// bounds (Lucene's block-max conjunction). A window runs from a document
+/// to the least last document of the blocks holding it, one per child that
+/// must match: inside it each such child's documents lie in that block, so
+/// a document there scores at most the sum of the blocks' bounds. Once
+/// `best` is full, a window whose sum does not pass the worst hit held is
+/// passed unscored (a document that only ties comes later in the snapshot
+/// than every hit held); otherwise the conjunction walks it as it would.
+fn conjunctionSegment(run: *Run, best: *Best, report: *Report, place: u32, s: *const Reader.Segment, a: *And) Error!void {
+    const n = a.positive.len;
+    var doc: u32 = 0;
+    // The last document of the window bounds were last taken for.
+    var window: ?u32 = null;
+    while (doc < done) {
+        if (best.threshold()) |t| if (window == null or doc > window.?) {
+            var bound: f64 = 0;
+            var last: u32 = done - 1;
+            for (a.positive) |*c| {
+                const b = try c.blockBound(doc);
+                bound += b.bound;
+                last = @min(last, b.last);
+            }
+            if (wand.sum(bound, n) <= @as(f64, t)) {
+                report.skipped += 1;
+                window = null;
+                doc = last + 1;
+                continue;
+            }
+            window = last;
+        };
+        const d = try a.seek(doc);
+        if (d == done) return;
+        // Past the window: take the bounds again where the children stand.
+        if (window != null and d > window.?) {
+            doc = d;
+            continue;
+        }
+        try run.collected();
+        if (!s.isDeleted(d)) {
+            report.scored += 1;
+            try best.add(.{ .segment = place, .doc = d, .score = try a.score() });
+        }
+        doc = d + 1;
+    }
 }
 
 /// A disjunction's best hits in one segment by block-max WAND (Ding and

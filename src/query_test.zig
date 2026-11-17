@@ -421,3 +421,104 @@ test "block-max WAND passes a block that cannot beat the best held, and scores t
     try testing.expect(report.skipped > 0);
     try testing.expect(report.scored < 400);
 }
+
+/// What every block-max conjunction run of the property passed unscored,
+/// and scored.
+var conjunction_skipped: u64 = 0;
+var conjunction_scored: u64 = 0;
+var conjunction_exhaustive: u64 = 0;
+
+/// A conjunction of required clauses, terms of each field boosted at
+/// times, with an excluded one at times.
+fn conjunctionOf(arena: std.mem.Allocator, s: *shakedown.Source) !Node {
+    const children = try arena.alloc(Node, gen.intRange(s, usize, 2, 4));
+    for (children) |*c| {
+        c.* = switch (gen.intRange(s, u8, 0, 5)) {
+            0, 1, 2 => .{ .term = .{ .field = body, .bytes = termOf(s) } },
+            3 => b: {
+                const child = try arena.create(Node);
+                child.* = .{ .term = .{ .field = body, .bytes = termOf(s) } };
+                break :b .{ .boost = .{ .node = child, .by = ([_]f32{ 0.5, 1.5, 3 })[gen.intRange(s, usize, 0, 2)] } };
+            },
+            4 => .{ .term = .{ .field = title, .bytes = termOf(s) } },
+            else => n: {
+                const child = try arena.create(Node);
+                child.* = .{ .term = .{ .field = tag, .bytes = tags[gen.intRange(s, usize, 0, tags.len - 1)] } };
+                break :n .{ .not = child };
+            },
+        };
+    }
+    return .{ .@"and" = children };
+}
+
+fn conjunctionMatches(_: void, case: *shakedown.Case) anyerror!void {
+    const s = case.source;
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var w: Writer = try .open(gpa, io, tmp.dir, &schema, merging);
+    defer w.deinit(io);
+    var versions: std.ArrayList(Version) = .empty;
+    try fill(&w, arena, s, &versions, 3, 500);
+    var r = try Reader.open(gpa, io, tmp.dir, &schema, .{});
+    defer r.deinit();
+    const ref = try referenceOf(arena, &r, versions.items);
+    for (0..6) |_| {
+        const root = try conjunctionOf(arena, s);
+        try Tree.check(&root, &schema, .{});
+        const top = gen.intRange(s, u32, 1, 10);
+        const pruned = try expectHits(&r, ref, &root, top, true);
+        const every = try expectHits(&r, ref, &root, top, false);
+        try expectPage(&r, ref, &root, top, true, gen.intRange(s, u32, 0, 5));
+        conjunction_skipped += pruned.skipped;
+        conjunction_scored += pruned.scored;
+        conjunction_exhaustive += every.scored;
+    }
+}
+
+test "the block-max conjunction gives the hits of every match scored, bit for bit, and passes blocks unscored" {
+    conjunction_skipped = 0;
+    conjunction_scored = 0;
+    conjunction_exhaustive = 0;
+    try shakedown.check(testing.allocator, {}, conjunctionMatches, .{ .seed = 0x636f_6e6a, .cases = 30 });
+    // Measured: 230 windows passed, 9,781 matches scored of 10,273 (8 s in
+    // Debug on macOS): random terms rarely leave a block below the bar.
+    try testing.expect(conjunction_skipped > 0);
+    try testing.expect(conjunction_scored < conjunction_exhaustive);
+}
+
+test "the block-max conjunction passes a window that cannot beat the best held, and scores the first document past it" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var w: Writer = try .open(gpa, io, tmp.dir, &schema, .{ .durability = .none });
+    defer w.deinit(io);
+    // "alpha beta" in every document, more of each in doc 5 and still more
+    // in doc 256, the first of the third block: the second block's bound
+    // is below doc 5's score, and the window ends at 255.
+    for (0..400) |d| {
+        const body_text = switch (d) {
+            5 => "alpha alpha alpha beta",
+            256 => "alpha alpha alpha beta beta",
+            else => "alpha beta",
+        };
+        try add(&w, .{ .id = d, .body = body_text, .title = "", .tag = "a", .n = 0 }, d, false);
+    }
+    _ = try w.commit(io);
+    var r = try Reader.open(gpa, io, tmp.dir, &schema, .{});
+    defer r.deinit();
+    const root: Node = .{ .@"and" = &.{ .{ .term = .{ .field = body, .bytes = "alpha" } }, .{ .term = .{ .field = body, .bytes = "beta" } } } };
+    var report: exec.Report = .{};
+    const hits = try exec.search(gpa, io, &r, &root, .{ .top = 1, .report = &report });
+    defer gpa.free(hits);
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqual(@as(u32, 256), hits[0].doc);
+    const every = try exec.search(gpa, io, &r, &root, .{ .top = 1, .wand = false });
+    defer gpa.free(every);
+    try testing.expectEqual(every[0].doc, hits[0].doc);
+    try testing.expect(report.skipped > 0);
+    try testing.expect(report.scored < 400);
+}
