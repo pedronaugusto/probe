@@ -24,6 +24,7 @@ test {
     _ = @import("bm25_test.zig");
     _ = @import("query_test.zig");
     _ = @import("parse_test.zig");
+    _ = @import("index_test.zig");
     _ = @import("concurrency_test.zig");
     _ = @import("crash_test.zig");
 }

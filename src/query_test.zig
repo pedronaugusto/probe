@@ -199,6 +199,24 @@ fn expectHits(r: *const Reader, ref: reference.Snapshot, root: *const Node, top:
     return report;
 }
 
+/// The page after the reference's hit `k` is the reference's hits from
+/// `k + 1` on.
+fn expectPage(r: *const Reader, ref: reference.Snapshot, root: *const Node, top: u32, wand: bool, k: u32) !void {
+    const gpa = testing.allocator;
+    const want = try ref.search(gpa, root, k + 1 + top);
+    defer gpa.free(want);
+    if (want.len <= k) return;
+    const got = try exec.search(gpa, io, r, root, .{ .top = top, .wand = wand, .after = want[k] });
+    defer gpa.free(got);
+    const rest = want[k + 1 ..];
+    try testing.expectEqual(rest.len, got.len);
+    for (rest, got) |a, b| {
+        try testing.expectEqual(a.segment, b.segment);
+        try testing.expectEqual(a.doc, b.doc);
+        try testing.expectEqual(@as(u32, @bitCast(a.score)), @as(u32, @bitCast(b.score)));
+    }
+}
+
 fn matchesReference(_: void, case: *shakedown.Case) anyerror!void {
     const s = case.source;
     const gpa = testing.allocator;
@@ -217,7 +235,10 @@ fn matchesReference(_: void, case: *shakedown.Case) anyerror!void {
     for (0..8) |_| {
         const root = try queryOf(arena, s, 3);
         try Tree.check(&root, &schema, .{});
-        _ = try expectHits(&r, ref, &root, gen.intRange(s, u32, 1, 50), gen.boolean(s));
+        const top = gen.intRange(s, u32, 1, 50);
+        const wand = gen.boolean(s);
+        _ = try expectHits(&r, ref, &root, top, wand);
+        try expectPage(&r, ref, &root, top, wand, gen.intRange(s, u32, 0, 20));
         try testing.expectEqual(try ref.count(gpa, &root), try exec.count(gpa, io, &r, &root, .{}));
     }
 }

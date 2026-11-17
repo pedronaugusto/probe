@@ -21,6 +21,43 @@ const files = segment.files;
 
 pub const Error = error{ NotFound, Corrupt, VersionTooNew, SchemaMismatch, ReadFailed, Canceled, OutOfMemory };
 
+/// The file an open failed on: the manifest, a segment or a deletions
+/// file, by name.
+pub const Failed = struct {
+    buffer: [max_name_bytes]u8 = undefined,
+    len: usize = 0,
+
+    pub const max_name_bytes = @max(files.max_name_bytes, Manifest.name_bytes);
+
+    pub fn name(f: *const Failed) []const u8 {
+        return f.buffer[0..f.len];
+    }
+
+    fn set(f: ?*Failed, bytes: []const u8) void {
+        const out = f orelse return;
+        @memcpy(out.buffer[0..bytes.len], bytes);
+        out.len = bytes.len;
+    }
+
+    /// Names the manifest of `generation`.
+    pub fn manifest(f: ?*Failed, generation: u64) void {
+        var b: [Manifest.name_bytes]u8 = undefined;
+        set(f, Manifest.name(&b, generation));
+    }
+
+    /// Names the segment file of `entry`.
+    pub fn segmentOf(f: ?*Failed, entry: Manifest.Segment) void {
+        var b: [files.max_name_bytes]u8 = undefined;
+        set(f, files.name(&b, entry.number, .segment, 0));
+    }
+
+    /// Names the deletions file `entry` names.
+    pub fn deletionsOf(f: ?*Failed, entry: Manifest.Segment) void {
+        var b: [files.max_name_bytes]u8 = undefined;
+        set(f, files.name(&b, entry.number, .deletions, entry.deletions.?.generation));
+    }
+};
+
 /// What a manifest is read against: the schema and term length the reader
 /// asks for, and where what differs is told.
 pub const Asked = struct {

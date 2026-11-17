@@ -514,3 +514,22 @@ const Parser = struct {
         return std.fmt.parseInt(u64, text, 10) catch p.fail(at, .bad_number, error.Invalid);
     }
 };
+
+/// What `parse` builds for a word in the field at `place`, on `arena`: a
+/// term, a phrase of its parts or all of them, a prefix when `prefix`, a
+/// keyword's bytes, a numeric field's one value; null when it analyzes to
+/// nothing. The query builders build words with it.
+pub fn wordClause(arena: Allocator, schema: []const Schema.Field, limits: Limits, place: u32, text: []const u8, prefix: bool) Error!?Node {
+    var p = try builder(arena, schema, limits);
+    return p.valueIn(place, .{ .bytes = text, .prefix = prefix, .escaped = false }, 0);
+}
+
+/// What `parse` builds for a quoted phrase in the field at `place`.
+pub fn phraseClause(arena: Allocator, schema: []const Schema.Field, limits: Limits, place: u32, text: []const u8, slop: u32) Error!?Node {
+    var p = try builder(arena, schema, limits);
+    return p.phraseOf(place, text, slop, 0);
+}
+
+fn builder(arena: Allocator, schema: []const Schema.Field, limits: Limits) Allocator.Error!Parser {
+    return .{ .arena = arena, .schema = schema, .limits = limits, .diagnostic = null, .text = "", .term = try arena.alloc(u8, limits.term_bytes), .defaults = &.{} };
+}

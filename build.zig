@@ -41,6 +41,17 @@ pub fn dev(b: *std.Build, tools: type) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
     check.dependOn(&tests.step);
     b.getInstallStep().dependOn(&tests.step);
+    // The README's usage, run with the tests.
+    const example = b.addExecutable(.{ .name = "usage", .root_module = b.createModule(.{
+        .root_source_file = p.path("examples/usage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "probe", .module = package.module("probe") }},
+    }) });
+    const examples = b.step("examples", "Build and run the usage example");
+    examples.dependOn(&b.addRunArtifact(example).step);
+    test_step.dependOn(examples);
+    check.dependOn(&example.step);
     // The release tier runs every property under Zig's fuzzer (each shakedown
     // property is a fuzz target) and the suite with safety on.
     tools.preflight.addCi(b, p, .{

@@ -68,6 +68,8 @@ pub const Options = struct {
     max_block: u32 = 16 * 1024 * 1024 + segment.store.block_bytes,
     /// Told what differs when the index is `SchemaMismatch`.
     mismatch: ?*Manifest.Mismatch = null,
+    /// Told the file an open failed on.
+    failed: ?*committed.Failed = null,
     /// Which segments `mergeStep` merges.
     merge: merge.Policy = .{},
 };
@@ -168,19 +170,30 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, o
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const asked: committed.Asked = .{ .fields = schema, .term_bytes = options.term_bytes, .mismatch = options.mismatch };
-    if (try committed.newest(arena.allocator(), io, dir, asked)) |m| {
+    if (try committed.newestGeneration(io, dir)) |generation| {
+        const m = committed.manifest(arena.allocator(), io, dir, generation, asked) catch |err| {
+            committed.Failed.manifest(options.failed, generation);
+            return err;
+        };
         w.generation = m.generation;
         w.next_segment = m.next_segment;
         try w.live.ensureTotalCapacity(gpa, m.segments.len);
         for (m.segments) |entry| {
             var held: Held.Handle = held: {
-                var opened = try Opened.open(gpa, io, dir, schema, entry, options.max_block);
+                var opened = Opened.open(gpa, io, dir, schema, entry, options.max_block) catch |err| {
+                    committed.Failed.segmentOf(options.failed, entry);
+                    return err;
+                };
                 errdefer opened.deinit(gpa, io);
                 break :held try .create(gpa, .{ .gpa = gpa, .io = io, .number = entry.number, .docs = entry.docs, .from = .{ .file = opened } });
             };
             errdefer held.release();
             var live: Live = .{ .number = entry.number, .docs = entry.docs, .held = held, .committed = true };
-            if (try committed.deletions(gpa, io, dir, entry)) |deleted| {
+            const deletions = committed.deletions(gpa, io, dir, entry) catch |err| {
+                committed.Failed.deletionsOf(options.failed, entry);
+                return err;
+            };
+            if (deletions) |deleted| {
                 live.deleted = deleted;
                 live.deleted_count = entry.deletions.?.count;
                 live.committed_count = live.deleted_count;

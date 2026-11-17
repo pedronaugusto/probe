@@ -8,11 +8,56 @@ last commit readable.
 
 ## Status
 
-In development, and not yet released. What is built so far: the schema a document type
-declares, the analysis of text into terms, the segment files, the writer with its commits
-and tiered merges, snapshots, and queries run over a snapshot (terms, phrases with slop,
-prefixes, numeric ranges, and, or, not and boosts). The query parser and the public `Index`
-type come next.
+In development, and not yet released. A document type declares how its fields are indexed,
+and `Index(Doc)` writes, commits, merges and searches it:
+
+<!-- BEGIN GENERATED zig build docs -- usage -->
+```zig
+const probe = @import("probe");
+
+const Entry = struct {
+    seq: u64,
+    level: []const u8,
+    message: []const u8,
+    pub const probe = .{
+        .id = .seq,
+        .fields = .{
+            .level = .{ .keyword = .{ .stored = true } },
+            .message = .{ .text = .{ .positions = true, .analysis = .words_and_identifiers } },
+        },
+    };
+};
+const Index = probe.Index(Entry);
+
+const w = try Index.openWriter(gpa, io, dir, .{});
+defer w.deinit(io);
+try w.add(io, .{ .seq = 1, .level = "ERR", .message = "segment merge failed in parseSpan" });
+try w.add(io, .{ .seq = 2, .level = "INFO", .message = "segment merged" });
+var done = try w.commit(io);
+var generation: u64 = undefined;
+done.take(&generation);
+
+const r = try Index.openReader(gpa, io, dir, .{});
+defer r.deinit();
+// An identifier's parts find it, as a phrase of words does.
+var q = try Index.Query.parse(gpa, .init("level:ERR \"parse span\""), .{});
+defer q.deinit();
+var hits = try r.search(io, &q, .{});
+defer hits.deinit();
+std.debug.assert(hits.hits.len == 1);
+std.debug.assert(hits.hits[0].id.raw() == 1);
+// The stored fields come back typed.
+var arena: std.heap.ArenaAllocator = .init(gpa);
+defer arena.deinit();
+const stored = try r.stored(io, hits.hits[0], arena.allocator());
+std.debug.assert(std.mem.eql(u8, stored.level, "ERR"));
+```
+<!-- END GENERATED -->
+
+Built so far: the analysis of text into terms, the segment files, the writer with its commits
+and tiered merges, snapshots, queries (terms, phrases with slop, prefixes, numeric ranges, and,
+or, not and boosts, from the query language or built in code) ranked by BM25 with block-max
+WAND, sorting by a numeric field, paging by cursor, and stored fields read back typed.
 
 ## Scoring
 

@@ -36,6 +36,8 @@ pub const Options = struct {
     retries: u8 = 8,
     /// Told what differs when the index is `SchemaMismatch`.
     mismatch: ?*Manifest.Mismatch = null,
+    /// Told the file an open failed on.
+    failed: ?*committed.Failed = null,
 };
 
 pub const OpenError = error{ NotFound, Busy, Corrupt, VersionTooNew, SchemaMismatch, ReadFailed, Canceled, OutOfMemory };
@@ -134,7 +136,10 @@ fn attempt(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, op
     defer arena.deinit();
     const asked: committed.Asked = .{ .fields = schema, .term_bytes = options.term_bytes, .mismatch = options.mismatch };
     const generation = try committed.newestGeneration(io, dir) orelse return error.NotFound;
-    const m = committed.manifest(arena.allocator(), io, dir, generation, asked) catch |err| return found(err);
+    const m = committed.manifest(arena.allocator(), io, dir, generation, asked) catch |err| {
+        committed.Failed.manifest(options.failed, generation);
+        return found(err);
+    };
     var segments: std.ArrayList(Segment) = try .initCapacity(gpa, m.segments.len);
     errdefer {
         for (segments.items) |*s| s.deinit(gpa);
@@ -164,7 +169,10 @@ fn segmentOf(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, 
         if (p.number() == entry.number and p.held.get().from == .file) break p;
     } else null;
     var held: Held.Handle = if (before) |p| p.held.retain() else held: {
-        var o = Opened.open(gpa, io, dir, schema, entry, options.max_block) catch |err| return found(err);
+        var o = Opened.open(gpa, io, dir, schema, entry, options.max_block) catch |err| {
+            committed.Failed.segmentOf(options.failed, entry);
+            return found(err);
+        };
         errdefer o.deinit(gpa, io);
         break :held try .create(gpa, .{ .gpa = gpa, .io = io, .number = entry.number, .docs = entry.docs, .from = .{ .file = o } });
     };
@@ -174,7 +182,10 @@ fn segmentOf(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, 
     const deleted: ?bitmap.Bitmap = if (before != null and std.meta.eql(before.?.deletions, deletions))
         if (before.?.deleted) |d| try d.clone(gpa) else null
     else
-        committed.deletions(gpa, io, dir, entry) catch |err| return found(err);
+        committed.deletions(gpa, io, dir, entry) catch |err| {
+            committed.Failed.deletionsOf(options.failed, entry);
+            return found(err);
+        };
     return .{
         .held = held,
         .deleted = deleted,

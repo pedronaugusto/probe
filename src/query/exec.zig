@@ -58,6 +58,9 @@ pub const Hit = struct {
     segment: u32,
     doc: u32,
     score: f32,
+    /// Its sort key when hits are sorted by a column: the value, or its
+    /// complement for a descending sort, so the lowest ranks first.
+    key: u64 = 0,
 
     /// Whether `a` ranks before `b`: a higher score, or an equal one
     /// earlier in the snapshot.
@@ -66,11 +69,33 @@ pub const Hit = struct {
         if (a.segment != b.segment) return a.segment < b.segment;
         return a.doc < b.doc;
     }
+
+    /// Whether `a` ranks before `b` sorted by `order`: by score, or by key
+    /// and then by place in the snapshot.
+    pub fn ranks(order: Order, a: Hit, b: Hit) bool {
+        if (order == .score) return a.before(b);
+        if (a.key != b.key) return a.key < b.key;
+        if (a.segment != b.segment) return a.segment < b.segment;
+        return a.doc < b.doc;
+    }
+};
+
+/// How hits are ordered.
+pub const Order = union(enum) {
+    /// Highest score first, equal scores by place in the snapshot.
+    score,
+    /// By the column of the numeric field at `field`, lowest first or
+    /// highest, equal values by place.
+    column: struct { field: u32, descending: bool = false },
 };
 
 pub const Options = struct {
     /// The most hits to give, at least 1.
     top: u32 = 10,
+    order: Order = .score,
+    /// Only hits that rank after this one, as `order` ranks: the last of
+    /// a page, so the next page goes on from it.
+    after: ?Hit = null,
     limits: Limits = .{},
     /// Whether a disjunction at the root runs block-max WAND; else every
     /// document it matches is scored.
@@ -82,8 +107,11 @@ pub const Options = struct {
 /// What a search did: the documents it scored, and the stretches of
 /// documents block-max WAND passed without scoring.
 pub const Report = struct {
+    /// Live documents scored: every live match when `pruned` is false.
     scored: u64 = 0,
     skipped: u64 = 0,
+    /// Whether WAND passed documents unscored in some segment.
+    pruned: bool = false,
 };
 
 /// The `options.top` best hits of `root` in `snapshot`, best first, which
@@ -94,7 +122,7 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var run: Run = try .init(arena.allocator(), io, snapshot, root, options.limits);
-    var best: Best = .{ .gpa = gpa, .top = options.top };
+    var best: Best = .{ .gpa = gpa, .top = options.top, .order = options.order, .after = options.after };
     defer best.deinit();
     var report: Report = .{};
     defer if (options.report) |r| {
@@ -103,10 +131,15 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
     for (snapshot.segments, 0..) |*s, place| {
         var it = try run.compile(s);
         defer run.reset();
-        if (options.wand and it.kind == .@"or") {
+        if (options.wand and options.order == .score and it.kind == .@"or") {
+            report.pruned = true;
             try wandSegment(&run, &best, &report, @intCast(place), s, it.kind.@"or");
             continue;
         }
+        var column: ?segment.columns.Cursor = switch (options.order) {
+            .score => null,
+            .column => |c| .init(s.read().column(c.field)),
+        };
         var doc: u32 = 0;
         while (true) : (doc += 1) {
             doc = try it.seek(doc);
@@ -114,7 +147,12 @@ pub fn search(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node
             try run.collected();
             if (s.isDeleted(doc)) continue;
             report.scored += 1;
-            try best.add(.{ .segment = @intCast(place), .doc = doc, .score = try it.score() });
+            var hit: Hit = .{ .segment = @intCast(place), .doc = doc, .score = try it.score() };
+            if (column) |*c| {
+                const v = try c.get(doc);
+                hit.key = if (options.order.column.descending) ~v else v;
+            }
+            try best.add(hit);
         }
     }
     return best.finish();
@@ -192,6 +230,13 @@ fn wandSegment(run: *Run, best: *Best, report: *Report, place: u32, s: *const Re
 
 /// How many live documents of `snapshot` match `root`.
 pub fn count(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node, limits: Limits) Error!u64 {
+    return countUpTo(gpa, io, snapshot, root, limits, std.math.maxInt(u64));
+}
+
+/// How many live documents of `snapshot` match `root`, counted until
+/// they pass `most`: at most `most + 1`. Documents are matched, never
+/// scored.
+pub fn countUpTo(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node, limits: Limits, most: u64) Error!u64 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var run: Run = try .init(arena.allocator(), io, snapshot, root, limits);
@@ -204,7 +249,9 @@ pub fn count(gpa: Allocator, io: Io, snapshot: *const Reader, root: *const Node,
             doc = try it.seek(doc);
             if (doc == done) break;
             try run.collected();
-            if (!s.isDeleted(doc)) n += 1;
+            if (s.isDeleted(doc)) continue;
+            n += 1;
+            if (n > most) return n;
         }
     }
     return n;
@@ -217,6 +264,8 @@ const done = std.math.maxInt(u32);
 const Best = struct {
     gpa: Allocator,
     top: u32,
+    order: Order = .score,
+    after: ?Hit = null,
     heap: std.ArrayList(Hit) = .empty,
 
     fn deinit(b: *Best) void {
@@ -229,9 +278,11 @@ const Best = struct {
     }
 
     fn add(b: *Best, hit: Hit) Allocator.Error!void {
+        // A page goes on from the hit that ended the one before.
+        if (b.after) |after| if (!Hit.ranks(b.order, after, hit)) return;
         const items = b.heap.items;
         if (items.len == b.top) {
-            if (!hit.before(items[0])) return;
+            if (!Hit.ranks(b.order, hit, items[0])) return;
             items[0] = hit;
             b.down(0);
             return;
@@ -240,7 +291,7 @@ const Best = struct {
         var i = b.heap.items.len - 1;
         while (i > 0) {
             const parent = (i - 1) / 2;
-            if (!b.heap.items[parent].before(b.heap.items[i])) break;
+            if (!Hit.ranks(b.order, b.heap.items[parent], b.heap.items[i])) break;
             std.mem.swap(Hit, &b.heap.items[parent], &b.heap.items[i]);
             i = parent;
         }
@@ -254,7 +305,7 @@ const Best = struct {
         while (true) {
             var worst = i;
             for ([_]usize{ 2 * i + 1, 2 * i + 2 }) |child| {
-                if (child < items.len and items[worst].before(items[child])) worst = child;
+                if (child < items.len and Hit.ranks(b.order, items[worst], items[child])) worst = child;
             }
             if (worst == i) return;
             std.mem.swap(Hit, &items[i], &items[worst]);
@@ -263,11 +314,7 @@ const Best = struct {
     }
 
     fn finish(b: *Best) Allocator.Error![]Hit {
-        std.mem.sort(Hit, b.heap.items, {}, struct {
-            fn lessThan(_: void, x: Hit, y: Hit) bool {
-                return x.before(y);
-            }
-        }.lessThan);
+        std.mem.sort(Hit, b.heap.items, b.order, Hit.ranks);
         return b.heap.toOwnedSlice(b.gpa);
     }
 };

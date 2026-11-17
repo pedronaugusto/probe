@@ -21,6 +21,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "query base", .patterns = &.{ "src/bm25.zig", "src/query/Tree.zig", "src/query/phrase.zig", "src/query/wand.zig", "src/query/parse.zig" } },
     .{ .name = "query", .patterns = &.{"src/query/exec.zig"} },
     .{ .name = "query entry", .patterns = &.{"src/query.zig"} },
+    .{ .name = "index api", .patterns = &.{"src/index.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
 
@@ -78,5 +79,6 @@ pub const required = [_][]const u8{
     "src/query/parse.zig",
     "src/query/exec.zig",
     "src/query.zig",
+    "src/index.zig",
     "src/probe.zig",
 };

@@ -17,7 +17,16 @@
   "layout_exceptions": {},
   "glint_paths": [
     "src",
+    "examples",
     "build.zig"
   ],
-  "docs": {}
+  "docs": {
+    "zig build docs -- usage": {
+      "source": "examples/usage.zig",
+      "region": "usage",
+      "imports": [
+        "probe"
+      ]
+    }
+  }
 }
