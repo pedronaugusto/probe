@@ -7,6 +7,8 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "analysis entry", .patterns = &.{"src/analysis.zig"} },
     .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig", "src/encoding/bitmap.zig" } },
     .{ .name = "encoding entry", .patterns = &.{"src/encoding.zig"} },
+    .{ .name = "segment", .patterns = &.{"src/segment/files.zig"} },
+    .{ .name = "segment entry", .patterns = &.{"src/segment.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
 
@@ -18,7 +20,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
     .{
         .name = "named dependencies",
         .unresolved_only = true,
-        .except_targets = &.{ "std", "aegis", "xenoglyph", "shakedown", "builtin" },
+        .except_targets = &.{ "std", "aegis", "xenoglyph", "warp", "shakedown", "builtin" },
     },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
 };
@@ -39,5 +41,7 @@ pub const required = [_][]const u8{
     "src/encoding/fst.zig",
     "src/encoding/bitmap.zig",
     "src/encoding.zig",
+    "src/segment/files.zig",
+    "src/segment.zig",
     "src/probe.zig",
 };

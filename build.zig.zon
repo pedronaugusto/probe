@@ -13,6 +13,10 @@
             .url = "git+https://github.com/pedronaugusto/xenoglyph#94cb967e102f01eb5ffdc70a0d4b5ef4213a5a35",
             .hash = "xenoglyph-0.5.1-YKXZleUEVABQrYd3pyFhxBed4pY4V5tB8t7EIuy8HUjb",
         },
+        .warp = .{
+            .url = "git+https://github.com/pedronaugusto/warp#809fa95d2132ca19001910e0c9cf07f3c175ce4f",
+            .hash = "warp-0.4.5-JASxFVb9MAB4RR4raR3s-M3_KijNneBhD4RtjFOFn921",
+        },
     },
     .dev_dependencies = .{
         .shakedown = .{

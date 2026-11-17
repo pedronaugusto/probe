@@ -9,4 +9,5 @@ test {
     _ = @import("bitmap_test.zig");
     _ = @import("schema_test.zig");
     _ = @import("analysis_test.zig");
+    _ = @import("segment_files_test.zig");
 }
