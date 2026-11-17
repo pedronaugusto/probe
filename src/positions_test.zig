@@ -4,9 +4,12 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const positions = @import("segment.zig").positions;
+const Files = @import("sources_test.zig").Files;
+const varint = @import("encoding/varint.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
+const io = testing.io;
 const Token = positions.Token;
 
 const max_docs = 400;
@@ -47,7 +50,8 @@ fn model(s: *shakedown.Source, doc_buffer: [][]const Token, token_buffer: []Toke
     return .{ .offsets = offsets, .docs = doc_buffer[0..df] };
 }
 
-fn againstList(_: void, case: *shakedown.Case) anyerror!void {
+fn againstList(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var doc_buffer: [max_docs][]const Token = undefined;
@@ -58,7 +62,7 @@ fn againstList(_: void, case: *shakedown.Case) anyerror!void {
     try bytes.appendSlice(gpa, "head");
     try positions.write(gpa, &bytes, m.docs, m.offsets);
     try bytes.appendSlice(gpa, "tail");
-    var r = try positions.Reader.parse(bytes.items[4..], @intCast(m.docs.len), m.offsets);
+    var r = try positions.Reader.init(try files.source(bytes.items, gen.boolean(s)), io, 4, @intCast(m.docs.len), m.offsets);
     var block: u32 = 0;
     while (block * 128 < m.docs.len) : (block += 1) {
         const docs = m.docs[block * 128 .. @min(block * 128 + 128, m.docs.len)];
@@ -88,7 +92,9 @@ fn againstList(_: void, case: *shakedown.Case) anyerror!void {
 }
 
 test "a term's positions read back as written, any document read, read in part or passed, any block passed" {
-    try shakedown.check(testing.allocator, {}, againstList, .{ .seed = 0x706f7369, .cases = 1500 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, againstList, .{ .seed = 0x706f7369, .cases = 1500 });
 }
 
 test "a whole group passed unread moves past its bytes, its bits byte included" {
@@ -100,7 +106,7 @@ test "a whole group passed unread moves past its bytes, its bits byte included" 
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
     try positions.write(gpa, &bytes, &.{ &first, &second }, false);
-    var r = try positions.Reader.parse(bytes.items, 2, false);
+    var r = try positions.Reader.init(.{ .memory = bytes.items }, io, 0, 2, false);
     try r.enter(0, first.len + second.len);
     try r.document(first.len);
     try r.document(second.len);
@@ -130,22 +136,26 @@ fn readsWithin(r: *positions.Reader, freqs: []const u32) !void {
     }
 }
 
-fn anyBytes(_: void, case: *shakedown.Case) anyerror!void {
+fn anyBytes(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     var buffer: [512]u8 = undefined;
     const bytes = gen.bytesInto(s, &buffer);
     var freqs: [300]u32 = undefined;
     const df = gen.intRange(s, usize, 1, freqs.len);
     for (freqs[0..df]) |*f| f.* = gen.intRange(s, u32, 1, 300);
-    var r = positions.Reader.parse(bytes, @intCast(df), gen.boolean(s)) catch return;
+    var r = positions.Reader.init(try files.source(bytes, gen.boolean(s)), io, gen.intRange(s, u64, 0, bytes.len), @intCast(df), gen.boolean(s)) catch return;
     try readsWithin(&r, freqs[0..df]);
 }
 
 test "fuzz: any bytes are refused as positions, or read rising" {
-    try shakedown.check(testing.allocator, {}, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
 }
 
-fn damaged(_: void, case: *shakedown.Case) anyerror!void {
+fn damaged(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var doc_buffer: [max_docs][]const Token = undefined;
@@ -160,10 +170,47 @@ fn damaged(_: void, case: *shakedown.Case) anyerror!void {
     if (gen.boolean(s)) bytes.shrinkRetainingCapacity(gen.intRange(s, usize, 0, bytes.items.len));
     var freqs: [max_docs]u32 = undefined;
     for (m.docs, freqs[0..m.docs.len]) |d, *f| f.* = @intCast(d.len);
-    var r = positions.Reader.parse(bytes.items, @intCast(m.docs.len), m.offsets) catch return;
+    var r = positions.Reader.init(try files.source(bytes.items, gen.boolean(s)), io, 0, @intCast(m.docs.len), m.offsets) catch return;
     try readsWithin(&r, freqs[0..m.docs.len]);
 }
 
 test "fuzz: damaged positions are refused, or read rising" {
-    try shakedown.check(testing.allocator, {}, damaged, .{ .seed = 0x64616d67, .cases = 2000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, damaged, .{ .seed = 0x64616d67, .cases = 2000 });
+}
+
+test "chunk lengths that end before their length says are refused" {
+    const gpa = testing.allocator;
+    var tokens: [300][1]Token = undefined;
+    var docs: [300][]const Token = undefined;
+    for (&tokens, &docs, 0..) |*t, *d, i| {
+        t.* = .{.{ .position = @intCast(i % 7) }};
+        d.* = t;
+    }
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try positions.write(gpa, &bytes, &docs, false);
+    // The same positions with a byte after the lengths, their length one more.
+    var at: usize = 0;
+    const length_bytes = try varint.read(bytes.items, &at);
+    var padded: std.ArrayList(u8) = .empty;
+    defer padded.deinit(gpa);
+    try varint.append(gpa, &padded, length_bytes + 1);
+    try padded.appendSlice(gpa, bytes.items[at..][0..@intCast(length_bytes)]);
+    try padded.append(gpa, 0);
+    try padded.appendSlice(gpa, bytes.items[at + @as(usize, @intCast(length_bytes)) ..]);
+    inline for (.{ bytes.items, padded.items }, .{ false, true }) |body, refused| {
+        var r = try positions.Reader.init(.{ .memory = body }, io, 0, docs.len, false);
+        const read: anyerror!void = blk: {
+            var block: u32 = 0;
+            while (block * 128 < docs.len) : (block += 1) {
+                const n = @min(128, docs.len - block * 128);
+                r.enter(block, n) catch |err| break :blk err;
+                for (0..n) |_| r.document(1) catch |err| break :blk err;
+                r.skip() catch |err| break :blk err;
+            }
+        };
+        if (refused) try testing.expectError(error.Corrupt, read) else try read;
+    }
 }

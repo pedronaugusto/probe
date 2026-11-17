@@ -3,6 +3,9 @@
 //!
 //! This file is internal. `probe.zig` is the package.
 
+/// Where a body is read from: memory, or a file read positionally.
+pub const source = @import("segment/source.zig");
+
 /// A segment's file names, and the header and footer each file carries.
 pub const files = @import("segment/files.zig");
 

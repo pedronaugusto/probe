@@ -10,13 +10,20 @@
 //!     end CRC-32C of every byte before it, u32
 //!
 //! Integers are little endian. A file is read back only through `check`,
-//! which refuses one whose bytes break any of this: a file of another kind
-//! or another segment under this name, or of a newer format.
+//! which reads it whole, or `open`, which gives its body as a source read
+//! positionally once its header is checked, and `verify`, which reads it
+//! whole for its checksum. Each refuses a file whose bytes break any of
+//! this: a file of another kind or another segment under this name, or of
+//! a newer format.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
 const aegis = @import("aegis");
 const warp = @import("warp");
+const source_mod = @import("source.zig");
+
+const Io = std.Io;
+const Source = source_mod.Source;
 
 /// What a file holds.
 pub const Kind = enum(u8) {
@@ -122,16 +129,65 @@ pub const Expected = struct {
 
     fn read(e: Expected, bytes: []const u8) CheckError!Body {
         if (bytes.len < header_bytes + footer_bytes) return error.Corrupt;
-        if (!std.mem.eql(u8, bytes[0..8], magic)) return error.Corrupt;
-        const version = std.mem.readInt(u16, bytes[8..10], .little);
-        if (version == 0) return error.Corrupt;
-        if (version > format) return error.VersionTooNew;
-        if (bytes[10] != @backingInt(e.kind)) return error.Corrupt;
-        for (bytes[11..16]) |b| if (b != 0) return error.Corrupt;
-        if (std.mem.readInt(u64, bytes[16..24], .little) != e.segment) return error.Corrupt;
+        try e.checkHeader(bytes[0..header_bytes]);
         const end = bytes.len - footer_bytes;
         const stored = std.mem.readInt(u32, bytes[end..][0..4], .little);
         if (crc32c(0, bytes[0..end]) != stored) return error.Corrupt;
         return .{ .bytes = bytes[header_bytes..end] };
     }
+
+    fn checkHeader(e: Expected, h: *const [header_bytes]u8) CheckError!void {
+        if (!std.mem.eql(u8, h[0..8], magic)) return error.Corrupt;
+        const version = std.mem.readInt(u16, h[8..10], .little);
+        if (version == 0) return error.Corrupt;
+        if (version > format) return error.VersionTooNew;
+        if (h[10] != @backingInt(e.kind)) return error.Corrupt;
+        for (h[11..16]) |b| if (b != 0) return error.Corrupt;
+        if (std.mem.readInt(u64, h[16..24], .little) != e.segment) return error.Corrupt;
+    }
+
+    /// `file`'s body as a source read positionally, once its header says
+    /// it is this file in a format this build reads. Its checksum is not
+    /// read here: `verify` reads the whole file for it.
+    pub fn open(e: Expected, io: Io, file: Io.File) OpenError!Source {
+        const len = file.length(io) catch |err| return failed(err);
+        if (len < header_bytes + footer_bytes) return error.Corrupt;
+        var h: [header_bytes]u8 = undefined;
+        try (Source{ .file = .{ .file = .of(file), .start = 0, .len = len } }).read(io, 0, &h);
+        try e.checkHeader(&h);
+        return .{ .file = .{ .file = .of(file), .start = header_bytes, .len = len - header_bytes - footer_bytes } };
+    }
+
+    /// Whether `file`, opened by `open`, holds every byte its footer's
+    /// CRC-32C says: read whole on `io`, through `buffer`.
+    pub fn verify(e: Expected, io: Io, file: Io.File, buffer: []u8) OpenError!void {
+        aegis.assert.invariant(buffer.len > 0, "a buffer to read through");
+        const len = file.length(io) catch |err| return failed(err);
+        if (len < header_bytes + footer_bytes) return error.Corrupt;
+        const whole: Source = .{ .file = .{ .file = .of(file), .start = 0, .len = len } };
+        var h: [header_bytes]u8 = undefined;
+        try whole.read(io, 0, &h);
+        try e.checkHeader(&h);
+        const end = len - footer_bytes;
+        var crc: u32 = 0;
+        var at: u64 = 0;
+        while (at < end) {
+            const n: usize = @intCast(@min(buffer.len, end - at));
+            try whole.read(io, at, buffer[0..n]);
+            crc = crc32c(crc, buffer[0..n]);
+            at += n;
+        }
+        var f: [footer_bytes]u8 = undefined;
+        try whole.read(io, end, &f);
+        if (std.mem.readInt(u32, &f, .little) != crc) return error.Corrupt;
+    }
 };
+
+pub const OpenError = CheckError || source_mod.Error;
+
+fn failed(err: Io.File.LengthError) OpenError {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.ReadFailed,
+    };
+}

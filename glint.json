@@ -1,0 +1,5 @@
+{
+  "seams": [
+    { "file": "src/segment/source.zig", "rules": ["A009"], "reason": "the reads of a segment's own files a reader keeps open: each range handed to the segment readers, which check every value as they decode it, the whole file's CRC-32C read by files.verify" }
+  ]
+}

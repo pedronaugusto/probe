@@ -3,9 +3,12 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const files = @import("segment.zig").files;
+const Files = @import("sources_test.zig").Files;
+const Source = @import("segment.zig").source.Source;
 
 const testing = std.testing;
 const gen = shakedown.gen;
+const io = testing.io;
 
 fn frame(buffer: []u8, kind: files.Kind, segment: u64, body: []const u8) []u8 {
     const h = files.header(kind, segment);
@@ -82,4 +85,52 @@ fn anyBytes(_: void, case: *shakedown.Case) anyerror!void {
 
 test "fuzz: any bytes are refused as a file, or give a body within them" {
     try shakedown.check(testing.allocator, {}, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
+}
+
+fn openedAsChecked(f: *Files, case: *shakedown.Case) anyerror!void {
+    defer f.close();
+    const s = case.source;
+    var body_buffer: [300]u8 = undefined;
+    const body = gen.bytesInto(s, &body_buffer);
+    const kind = gen.enumValue(s, files.Kind);
+    const segment = gen.intRange(s, u64, 0, 3);
+    var buffer: [400]u8 = undefined;
+    const file = frame(&buffer, kind, segment, body);
+    // Changed anywhere, or cut short, or not.
+    const change = gen.intRange(s, u8, 0, 3);
+    const bytes = switch (change) {
+        0 => file,
+        1 => file[0..gen.intRange(s, usize, 0, file.len)],
+        else => blk: {
+            file[gen.intRange(s, usize, 0, file.len - 1)] ^= @as(u8, 1) << gen.intRange(s, u3, 0, 7);
+            break :blk file;
+        },
+    };
+    const e: files.Expected = .{ .kind = gen.enumValue(s, files.Kind), .segment = gen.intRange(s, u64, 0, 3) };
+    const opened = try f.fileOf(bytes);
+    var verify_buffer: [64]u8 = undefined;
+    const by_check = e.check(.init(bytes));
+    const verify_len = gen.intRange(s, usize, 1, verify_buffer.len);
+    const by_open: files.OpenError!Source = blk: {
+        const source = e.open(io, opened) catch |err| break :blk err;
+        e.verify(io, opened, verify_buffer[0..verify_len]) catch |err| break :blk err;
+        break :blk source;
+    };
+    if (by_check) |checked_body| {
+        const source = try by_open;
+        var read_back: [300]u8 = undefined;
+        try testing.expectEqual(checked_body.bytes.len, source.len());
+        try source.read(io, 0, read_back[0..checked_body.bytes.len]);
+        try testing.expectEqualSlices(u8, checked_body.bytes, read_back[0..checked_body.bytes.len]);
+    } else |err| try testing.expectError(err, by_open);
+    // A whole file is refused at its open for its header alone.
+    if (change == 0) {
+        if (by_check) |_| {} else |err| try testing.expectError(err, e.open(io, opened));
+    }
+}
+
+test "a file opened and verified is refused or read exactly as a check of its bytes" {
+    var f: Files = .init();
+    defer f.deinit();
+    try shakedown.check(testing.allocator, &f, openedAsChecked, .{ .seed = 0x6f70656e, .cases = 1500 });
 }

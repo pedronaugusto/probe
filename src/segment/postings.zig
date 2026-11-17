@@ -4,6 +4,7 @@
 //! The bytes, at the term's address in the postings file:
 //!
 //!     df                       the documents, a varint, at least one
+//!     skip bytes               the skip entries' length, a varint
 //!     skip entry per block     ceil(df / 128) of them:
 //!         last                 the block's last doc, less the block
 //!                              before's (the first block's whole)
@@ -23,22 +24,28 @@
 //! length, which bounds every document of it in fixed space. A query bounds
 //! a block's score from them with the snapshot's statistics.
 //!
-//! A reader walks forward only, skips a block by its skip entry without
-//! decoding it, and checks what it reads: doc ids rise and stay inside the
-//! segment, each block ends at the doc its skip entry says, and every
-//! length the entries give stays inside the bytes. Bytes that break a rule
-//! are `error.Corrupt`.
+//! A reader reads from a `Source`, the skip entries and the blocks each
+//! through a window of its own, so it reads what it walks and no more. It
+//! walks forward only, skips a block by its skip entry without reading it,
+//! and checks what it reads: doc ids rise and stay inside the segment, each
+//! block ends at the doc its skip entry says, the entries end where their
+//! length says, and every length stays inside the bytes. Bytes that break a
+//! rule are `error.Corrupt`.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
 const aegis = @import("aegis");
 const bitpack = @import("../encoding/bitpack.zig");
 const varint = @import("../encoding/varint.zig");
+const source_mod = @import("source.zig");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Source = source_mod.Source;
+const Window = source_mod.Window;
 const block_len = bitpack.block_len;
 
-pub const Error = error{Corrupt};
+pub const Error = source_mod.Error;
 
 /// A document of the term's, and how often the term occurs in it.
 pub const Posting = struct {
@@ -55,15 +62,27 @@ pub const Impact = struct {
 /// The most impacts a block keeps.
 pub const max_impacts = 8;
 
+/// The longest a skip entry is: its last doc, its length and its count,
+/// then each impact's two values.
+const max_entry_bytes = 3 * varint.max_bytes + max_impacts * 2 * varint.max_bytes;
+
+/// The longest a block is: a full one's two packed streams, or a short
+/// one's varints, at most five bytes each for a `u32`.
+pub const max_body_bytes = @max(2 * (1 + bitpack.max_block_bytes), (block_len - 1) * 2 * 5);
+
+/// A reader's window over the skip entries.
+const skip_window = 512;
+
 /// Appends the postings of one term to `out`. `postings` rise strictly by
 /// doc, at least one, each freq at least one; `lengths` holds each doc's
 /// length in the field, or is null for a field whose every document is one
 /// term long (a keyword).
 pub fn write(gpa: Allocator, out: *std.ArrayList(u8), postings: []const Posting, lengths: ?[]const u32) Allocator.Error!void {
     aegis.assert.invariant(postings.len > 0, "a term has at least one posting");
+    var skips: std.ArrayList(u8) = .empty;
+    defer skips.deinit(gpa);
     var bodies: std.ArrayList(u8) = .empty;
     defer bodies.deinit(gpa);
-    try varint.append(gpa, out, postings.len);
     var before: ?u32 = null;
     var at: usize = 0;
     while (at < postings.len) {
@@ -80,18 +99,21 @@ pub fn write(gpa: Allocator, out: *std.ArrayList(u8), postings: []const Posting,
             }
         }
         const last = block[block.len - 1].doc;
-        try varint.append(gpa, out, if (before) |b| last - b else last);
-        try varint.append(gpa, out, bodies.items.len - start);
+        try varint.append(gpa, &skips, if (before) |b| last - b else last);
+        try varint.append(gpa, &skips, bodies.items.len - start);
         var impacts: [max_impacts]Impact = undefined;
         const kept = competitive(block, lengths, &impacts);
-        try varint.append(gpa, out, kept.len);
+        try varint.append(gpa, &skips, kept.len);
         for (kept) |i| {
-            try varint.append(gpa, out, i.freq - 1);
-            try varint.append(gpa, out, i.length);
+            try varint.append(gpa, &skips, i.freq - 1);
+            try varint.append(gpa, &skips, i.length);
         }
         before = last;
         at += block.len;
     }
+    try varint.append(gpa, out, postings.len);
+    try varint.append(gpa, out, skips.items.len);
+    try out.appendSlice(gpa, skips.items);
     try out.appendSlice(gpa, bodies.items);
 }
 
@@ -144,19 +166,26 @@ fn competitive(block: []const Posting, lengths: ?[]const u32, out: *[max_impacts
     return out[0..kept];
 }
 
-/// A term's postings read from the bytes at its address, forward only.
+/// A term's postings read from the postings body at its address, forward
+/// only, a skip entry and a block at a time.
 pub const Reader = struct {
-    bytes: []const u8,
+    /// The skip entries' window and the blocks', each with its buffer.
+    skips: Window,
+    bodies: Window,
+    skip_buffer: [skip_window]u8 = undefined,
+    body_buffer: [max_body_bytes]u8 = undefined,
     /// The segment's documents: every doc id is below.
     docs: u32,
     df: u32,
     blocks: u32,
     /// The blocks entered so far; the reader stands in the last of them.
     entered: u32 = 0,
-    /// Where the next skip entry starts, and the body of the block the
-    /// reader stands in (the first block's before it enters one).
-    skip_at: usize,
-    body_at: usize,
+    /// Where the next skip entry starts and where the entries end, and the
+    /// block the reader stands in (the first block's before it enters
+    /// one): offsets in the postings body.
+    skip_at: u64,
+    skip_end: u64,
+    body_at: u64,
     /// The skip entry of the block the reader stands in, and the last doc
     /// of the block before it.
     last: u32 = 0,
@@ -171,34 +200,41 @@ pub const Reader = struct {
     count: u8 = 0,
     index: u8 = 0,
 
-    /// The postings at the start of `bytes` (which may run past them) in a
-    /// segment of `docs` documents. Every skip entry is read and checked
-    /// here, and the bodies' lengths against the bytes; each block is
-    /// checked as it is decoded.
-    pub fn parse(bytes: []const u8, docs: u32) Error!Reader {
+    /// The postings at `address` in `source`, the postings body of a
+    /// segment of `docs` documents, read on `io`. Each skip entry is
+    /// checked as it is entered, and each block as it is decoded.
+    pub fn init(source: Source, io: Io, address: u64, docs: u32) Error!Reader {
+        var window: Window = .init(source, io);
+        var head_buffer: [2 * varint.max_bytes]u8 = undefined;
+        const head = try window.upTo(&head_buffer, address, head_buffer.len, source.len());
         var at: usize = 0;
-        const df: u32 = @intCast(try varint.readAtMost(bytes, &at, docs));
+        const df: u32 = @intCast(try varint.readAtMost(head, &at, docs));
         if (df == 0) return error.Corrupt;
         const blocks: u32 = @intCast((@as(u64, df) + block_len - 1) / block_len);
-        const skip_at = at;
-        var body_bytes: usize = 0;
-        var last: ?u32 = null;
-        for (0..blocks) |_| {
-            const entry = try readEntry(bytes, &at, last, docs);
-            last = entry.last;
-            body_bytes = std.math.add(usize, body_bytes, entry.bytes) catch return error.Corrupt;
-        }
-        if (body_bytes > bytes.len - at) return error.Corrupt;
-        return .{ .bytes = bytes, .docs = docs, .df = df, .blocks = blocks, .skip_at = skip_at, .body_at = at };
+        // An entry takes three bytes at least, `max_entry_bytes` at most.
+        const skip_bytes = try varint.readAtMost(head, &at, @as(u64, blocks) * max_entry_bytes);
+        if (skip_bytes < @as(u64, blocks) * 3) return error.Corrupt;
+        const skip_at = address + at;
+        if (skip_bytes > source.len() - skip_at) return error.Corrupt;
+        return .{
+            .skips = .init(source, io),
+            .bodies = .init(source, io),
+            .docs = docs,
+            .df = df,
+            .blocks = blocks,
+            .skip_at = skip_at,
+            .skip_end = skip_at + skip_bytes,
+            .body_at = skip_at + skip_bytes,
+        };
     }
 
     const Entry = struct { last: u32, bytes: usize, impacts: [max_impacts]Impact, count: u8 };
 
-    fn readEntry(bytes: []const u8, at: *usize, before: ?u32, docs: u32) Error!Entry {
+    fn readEntry(bytes: []const u8, at: *usize, before: ?u32, docs: u32) varint.Error!Entry {
         const step = try varint.readAtMost(bytes, at, docs);
         const last = if (before) |b| @as(u64, b) + step else step;
         if ((before != null and step == 0) or last >= docs) return error.Corrupt;
-        var e: Entry = .{ .last = @intCast(last), .bytes = try varint.readAtMost(bytes, at, bytes.len), .impacts = undefined, .count = 0 };
+        var e: Entry = .{ .last = @intCast(last), .bytes = try varint.readAtMost(bytes, at, max_body_bytes), .impacts = undefined, .count = 0 };
         const count = try varint.readAtMost(bytes, at, max_impacts);
         if (count == 0) return error.Corrupt;
         for (e.impacts[0..count]) |*i| {
@@ -228,7 +264,7 @@ pub const Reader = struct {
 
     /// The first posting at or past `target` from where the reader stands,
     /// or null when none is. A block whose last doc is below `target` is
-    /// passed by its skip entry, never decoded.
+    /// passed by its skip entry, never read.
     pub fn advance(r: *Reader, target: u32) Error!?Posting {
         while (r.entered == 0 or r.last < target) {
             if (!try r.nextBlock()) return null;
@@ -256,7 +292,12 @@ pub const Reader = struct {
             r.before = r.last;
             r.body_at += r.body_bytes;
         }
-        const e = try readEntry(r.bytes, &r.skip_at, r.before, r.docs);
+        const bytes = try r.skips.upTo(&r.skip_buffer, r.skip_at, max_entry_bytes, r.skip_end);
+        var at: usize = 0;
+        const e = try readEntry(bytes, &at, r.before, r.docs);
+        r.skip_at += at;
+        // The last entry ends the entries.
+        if (r.entered + 1 == r.blocks and r.skip_at != r.skip_end) return error.Corrupt;
         r.last = e.last;
         r.body_bytes = e.bytes;
         r.impact_buffer = e.impacts;
@@ -269,7 +310,7 @@ pub const Reader = struct {
     }
 
     fn decode(r: *Reader) Error!void {
-        const body = r.bytes[r.body_at..][0..r.body_bytes];
+        const body = try r.bodies.bytes(&r.body_buffer, r.body_at, r.body_bytes);
         const full = r.entered < r.blocks or r.df % block_len == 0;
         const count: usize = if (full) block_len else r.df % block_len;
         var at: usize = 0;

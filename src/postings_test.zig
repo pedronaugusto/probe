@@ -4,9 +4,12 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const postings = @import("segment.zig").postings;
+const Files = @import("sources_test.zig").Files;
+const varint = @import("encoding/varint.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
+const io = testing.io;
 const Posting = postings.Posting;
 const Impact = postings.Impact;
 
@@ -80,7 +83,8 @@ fn competitive(m: Model, block: []const Posting, out: []Impact) []Impact {
     return out[0..n];
 }
 
-fn againstList(_: void, case: *shakedown.Case) anyerror!void {
+fn againstList(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var list_buffer: [700]Posting = undefined;
@@ -92,10 +96,10 @@ fn againstList(_: void, case: *shakedown.Case) anyerror!void {
     try bytes.appendSlice(gpa, "head");
     try postings.write(gpa, &bytes, m.list, m.lengths);
     try bytes.appendSlice(gpa, "tail");
-    const at_address = bytes.items[4..];
+    const source = try files.source(bytes.items, gen.boolean(s));
 
     // Read whole, with each block's impacts.
-    var r = try postings.Reader.parse(at_address, m.docs);
+    var r = try postings.Reader.init(source, io, 4, m.docs);
     try testing.expectEqual(@as(u32, @intCast(m.list.len)), r.docFreq());
     var block_start: usize = 0;
     for (m.list, 0..) |want, i| {
@@ -129,7 +133,7 @@ fn againstList(_: void, case: *shakedown.Case) anyerror!void {
 
     // Advanced to rising targets, with a next between some: always the first
     // posting at or past the target from where the reader stands.
-    var a = try postings.Reader.parse(at_address, m.docs);
+    var a = try postings.Reader.init(source, io, 4, m.docs);
     var at: usize = 0;
     var target: u32 = 0;
     while (true) {
@@ -157,7 +161,9 @@ fn againstList(_: void, case: *shakedown.Case) anyerror!void {
 }
 
 test "a term's postings read back as written, advance to any target, and each block's impacts are its competitive pairs" {
-    try shakedown.check(testing.allocator, {}, againstList, .{ .seed = 0x706f7374, .cases = 1500 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, againstList, .{ .seed = 0x706f7374, .cases = 1500 });
 }
 
 fn impactsOf(list: []const Posting, lengths: []const u32, docs: u32, out: *[postings.max_impacts]Impact) ![]const Impact {
@@ -165,7 +171,7 @@ fn impactsOf(list: []const Posting, lengths: []const u32, docs: u32, out: *[post
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
     try postings.write(gpa, &bytes, list, lengths);
-    var r = try postings.Reader.parse(bytes.items, docs);
+    var r = try postings.Reader.init(.{ .memory = bytes.items }, io, 0, docs);
     _ = try r.next();
     const kept = r.impacts();
     @memcpy(out[0..kept.len], kept);
@@ -204,22 +210,28 @@ fn readsWithin(r: *postings.Reader, docs: u32) !void {
     }
 }
 
-fn anyBytes(_: void, case: *shakedown.Case) anyerror!void {
+fn anyBytes(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     var buffer: [512]u8 = undefined;
     const bytes = gen.bytesInto(s, &buffer);
     const docs = gen.intRange(s, u32, 1, 5000);
-    var r = postings.Reader.parse(bytes, docs) catch return;
+    const source = try files.source(bytes, gen.boolean(s));
+    const address = gen.intRange(s, u64, 0, bytes.len);
+    var r = postings.Reader.init(source, io, address, docs) catch return;
     try readsWithin(&r, docs);
-    var a = postings.Reader.parse(bytes, docs) catch return;
+    var a = postings.Reader.init(source, io, address, docs) catch return;
     _ = a.advance(gen.intRange(s, u32, 0, docs)) catch return;
 }
 
 test "fuzz: any bytes are refused as postings, or read within the segment, rising" {
-    try shakedown.check(testing.allocator, {}, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
 }
 
-fn damaged(_: void, case: *shakedown.Case) anyerror!void {
+fn damaged(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var list_buffer: [700]Posting = undefined;
@@ -233,10 +245,40 @@ fn damaged(_: void, case: *shakedown.Case) anyerror!void {
         bytes.items[at] = gen.int(s, u8);
     }
     if (gen.boolean(s)) bytes.shrinkRetainingCapacity(gen.intRange(s, usize, 0, bytes.items.len));
-    var r = postings.Reader.parse(bytes.items, m.docs) catch return;
+    var r = postings.Reader.init(try files.source(bytes.items, gen.boolean(s)), io, 0, m.docs) catch return;
     try readsWithin(&r, m.docs);
 }
 
 test "fuzz: damaged postings are refused, or read within the segment, rising" {
-    try shakedown.check(testing.allocator, {}, damaged, .{ .seed = 0x64616d67, .cases = 2000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, damaged, .{ .seed = 0x64616d67, .cases = 2000 });
+}
+
+test "skip entries that end before their length says are refused" {
+    const gpa = testing.allocator;
+    var list: [300]Posting = undefined;
+    for (&list, 0..) |*p, i| p.* = .{ .doc = @intCast(i * 2), .freq = 1 };
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try postings.write(gpa, &bytes, &list, null);
+    var r = try postings.Reader.init(.{ .memory = bytes.items }, io, 0, 600);
+    while (try r.next()) |_| {}
+    // The same postings with a byte after the entries, their length one more.
+    var at: usize = 0;
+    _ = try varint.read(bytes.items, &at);
+    const len_at = at;
+    const skip_bytes = try varint.read(bytes.items, &at);
+    var padded: std.ArrayList(u8) = .empty;
+    defer padded.deinit(gpa);
+    try padded.appendSlice(gpa, bytes.items[0..len_at]);
+    try varint.append(gpa, &padded, skip_bytes + 1);
+    try padded.appendSlice(gpa, bytes.items[at..][0..@intCast(skip_bytes)]);
+    try padded.append(gpa, 0);
+    try padded.appendSlice(gpa, bytes.items[at + @as(usize, @intCast(skip_bytes)) ..]);
+    var p = try postings.Reader.init(.{ .memory = padded.items }, io, 0, 600);
+    const read: anyerror!void = while (p.next()) |posting| {
+        if (posting == null) break;
+    } else |err| err;
+    try testing.expectError(error.Corrupt, read);
 }

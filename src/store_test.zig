@@ -4,10 +4,14 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const store = @import("segment.zig").store;
+const Files = @import("sources_test.zig").Files;
+const varint = @import("encoding/varint.zig");
+const warp = @import("warp");
 const Schema = @import("Schema.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
+const io = testing.io;
 
 const schema = [_]Schema.Field{
     .{ .name = "title", .kind = .text, .stored = true },
@@ -28,7 +32,8 @@ fn bytesOf(s: *shakedown.Source, pool: []const u8) []const u8 {
     return pool[start..][0..len];
 }
 
-fn againstValues(_: void, case: *shakedown.Case) anyerror!void {
+fn againstValues(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var pool: [40 * 1024]u8 = undefined;
@@ -44,14 +49,15 @@ fn againstValues(_: void, case: *shakedown.Case) anyerror!void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
     try w.finish(&body);
-    const st = try store.Store.parse(body.items, docs, &schema, max_block);
+    var st = try store.Store.parse(gpa, io, try files.source(body.items, gen.boolean(s)), docs, &schema, max_block);
+    defer st.deinit(gpa);
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(gpa);
     var out: [stored_fields]store.Value = undefined;
     if (docs == 0) return;
     for (0..docs) |_| {
         const doc = gen.intRange(s, u32, 0, docs - 1);
-        try st.read(gpa, doc, &buffer, &out);
+        try st.read(io, gpa, doc, &buffer, &out);
         for (values[doc], out) |want, got| switch (want) {
             .bytes => |b| try testing.expectEqualSlices(u8, b, got.bytes),
             .numeric => |n| try testing.expectEqual(n, got.numeric),
@@ -60,7 +66,9 @@ fn againstValues(_: void, case: *shakedown.Case) anyerror!void {
 }
 
 test "every document's stored values read back, from blocks of any count" {
-    try shakedown.check(testing.allocator, {}, againstValues, .{ .seed = 0x73746f72, .cases = 300 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, againstValues, .{ .seed = 0x73746f72, .cases = 300 });
 }
 
 fn readsWithin(st: store.Store, s: *shakedown.Source) !void {
@@ -70,7 +78,7 @@ fn readsWithin(st: store.Store, s: *shakedown.Source) !void {
     var out: [stored_fields]store.Value = undefined;
     if (st.docs == 0) return;
     for (0..4) |_| {
-        const read = st.read(gpa, gen.intRange(s, u32, 0, st.docs - 1), &buffer, &out);
+        const read = st.read(io, gpa, gen.intRange(s, u32, 0, st.docs - 1), &buffer, &out);
         // Refused or not, a read takes no more than a block's bound.
         try testing.expect(buffer.items.len <= max_block);
         read catch |err| switch (err) {
@@ -80,18 +88,24 @@ fn readsWithin(st: store.Store, s: *shakedown.Source) !void {
     }
 }
 
-fn anyBytes(_: void, case: *shakedown.Case) anyerror!void {
+fn anyBytes(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     var bytes: [256]u8 = undefined;
-    const st = store.Store.parse(gen.bytesInto(s, &bytes), gen.intRange(s, u32, 0, 50), &schema, max_block) catch return;
+    const source = try files.source(gen.bytesInto(s, &bytes), gen.boolean(s));
+    var st = store.Store.parse(testing.allocator, io, source, gen.intRange(s, u32, 0, 50), &schema, max_block) catch return;
+    defer st.deinit(testing.allocator);
     try readsWithin(st, s);
 }
 
 test "fuzz: any bytes are refused as a store, or read within its bounds" {
-    try shakedown.check(testing.allocator, {}, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, anyBytes, .{ .seed = 0x66757a7a, .cases = 3000 });
 }
 
-fn damaged(_: void, case: *shakedown.Case) anyerror!void {
+fn damaged(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var pool: [40 * 1024]u8 = undefined;
@@ -106,10 +120,74 @@ fn damaged(_: void, case: *shakedown.Case) anyerror!void {
     for (0..gen.intRange(s, usize, 1, 4)) |_| {
         body.items[gen.intRange(s, usize, 0, body.items.len - 1)] = gen.int(s, u8);
     }
-    const st = store.Store.parse(body.items, docs, &schema, max_block) catch return;
+    // The table's check made whole again, mostly, so the checks behind it
+    // are what is tested.
+    if (gen.intRange(s, u8, 0, 3) != 0) fixCheck(body.items);
+    var st = store.Store.parse(gpa, io, try files.source(body.items, gen.boolean(s)), docs, &schema, max_block) catch return;
+    defer st.deinit(gpa);
     try readsWithin(st, s);
 }
 
+/// Rewrites the CRC-32C of the block count and table `body` begins with,
+/// where they fit.
+fn fixCheck(body: []u8) void {
+    var at: usize = 0;
+    const blocks = varint.read(body, &at) catch return;
+    if (blocks > (body.len - at) / 20) return;
+    const end = at + @as(usize, @intCast(blocks)) * 20;
+    if (end + 4 > body.len) return;
+    std.mem.writeInt(u32, body[end..][0..4], warp.crc32c(0, body[0..end]), .little);
+}
+
 test "fuzz: a damaged store is refused, or read within its bounds" {
-    try shakedown.check(testing.allocator, {}, damaged, .{ .seed = 0x64616d67, .cases = 1000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, damaged, .{ .seed = 0x64616d67, .cases = 1000 });
+}
+
+test "a block refused leaves the buffer within the bound" {
+    const gpa = testing.allocator;
+    var w: store.Writer = try .init(gpa);
+    defer w.deinit();
+    var text: [3000]u8 = undefined;
+    for (&text, 0..) |*b, i| b.* = @truncate(i *% 13);
+    try w.add(&.{ .{ .bytes = &text }, .{ .numeric = 1 }, .{ .bytes = "x" } });
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try w.finish(&body);
+    // One block: the bound is its decoded length exactly; its compressed
+    // bytes, after the varint and the table's one entry, are spoiled.
+    const raw = std.mem.readInt(u32, body.items[1 + 4 ..][0..4], .little);
+    @memset(body.items[1 + 20 + 4 ..], 0xff);
+    var st = try store.Store.parse(gpa, io, .{ .memory = body.items }, 1, &schema, raw);
+    defer st.deinit(gpa);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    var out: [stored_fields]store.Value = undefined;
+    try testing.expectError(error.Corrupt, st.read(io, gpa, 0, &buffer, &out));
+    try testing.expect(buffer.items.len <= raw);
+}
+
+fn tableFlip(_: void, case: *shakedown.Case) anyerror!void {
+    const s = case.source;
+    const gpa = testing.allocator;
+    var pool: [40 * 1024]u8 = undefined;
+    for (&pool, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const docs = gen.intRange(s, u32, 1, 60);
+    var w: store.Writer = try .init(gpa);
+    defer w.deinit();
+    for (0..docs) |_| try w.add(&.{ .{ .bytes = bytesOf(s, &pool) }, .{ .numeric = gen.int(s, u64) }, .{ .bytes = bytesOf(s, &pool) } });
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try w.finish(&body);
+    var at: usize = 0;
+    const blocks: usize = @intCast(try varint.read(body.items, &at));
+    // Any one bit of the block count, the table or its check.
+    const flip = gen.intRange(s, usize, 0, at + blocks * 20 + 4 - 1);
+    body.items[flip] ^= @as(u8, 1) << gen.intRange(s, u3, 0, 7);
+    try testing.expectError(error.Corrupt, store.Store.parse(gpa, io, .{ .memory = body.items }, docs, &schema, max_block));
+}
+
+test "a store whose table has any one bit changed is refused when parsed" {
+    try shakedown.check(testing.allocator, {}, tableFlip, .{ .seed = 0x7461626c, .cases = 1000 });
 }

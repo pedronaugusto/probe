@@ -7,11 +7,13 @@ const shakedown = @import("shakedown");
 const segment = @import("segment.zig");
 const Schema = @import("Schema.zig");
 const Pipeline = @import("analysis.zig").Pipeline;
+const Files = @import("sources_test.zig").Files;
 
 const testing = std.testing;
 const gen = shakedown.gen;
+const io = testing.io;
 const write = segment.write;
-const files = segment.files;
+const segment_files = segment.files;
 const positions = segment.positions;
 const Posting = segment.postings.Posting;
 
@@ -80,7 +82,8 @@ fn schemaOf(s: *shakedown.Source, out: *[max_fields]Schema.Field) []Schema.Field
     return out[0..n];
 }
 
-fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
+fn againstModel(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var schema_buffer: [max_fields]Schema.Field = undefined;
@@ -141,13 +144,7 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     const segment_number = gen.int(s, u64);
     var out = try builder.finish(segment_number);
     defer out.deinit(gpa);
-    var bodies: segment.read.Bodies = undefined;
-    inline for (.{ "terms", "postings", "positions", "lengths", "ids", "columns", "store" }) |name| {
-        const kind = @field(files.Kind, name);
-        const e: files.Expected = .{ .kind = kind, .segment = segment_number };
-        @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
-    }
-    var seg = try segment.read.Segment.parse(gpa, bodies, schema, 1 << 20);
+    var seg = try segment.read.Segment.parse(gpa, io, try bodiesOf(files, s, &out, segment_number), schema, 1 << 20);
     defer seg.deinit(gpa);
     try testing.expectEqual(docs, seg.docs);
 
@@ -155,11 +152,11 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
         const place: u32 = @intCast(p);
         var it = model.fields[p].iterator();
         while (it.next()) |entry| {
-            var r = (try seg.term(place, entry.key_ptr.*)) orelse return error.TestExpectedEqual;
+            var r = (try seg.term(io, place, entry.key_ptr.*)) orelse return error.TestExpectedEqual;
             try expectPostings(&r, entry.value_ptr.items, f);
         }
         // A term the field does not hold.
-        if (!model.fields[p].contains("zz")) try testing.expectEqual(null, try seg.term(place, "zz"));
+        if (!model.fields[p].contains("zz")) try testing.expectEqual(null, try seg.term(io, place, "zz"));
         if (f.kind == .text) {
             var total: u64 = 0;
             for (0..docs) |d| {
@@ -190,12 +187,38 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     defer buffer.deinit(gpa);
     var got: [max_fields]segment.store.Value = undefined;
     for (0..docs) |d| {
-        try seg.storedOf(gpa, @intCast(d), &buffer, got[0..stored]);
+        try seg.storedOf(io, gpa, @intCast(d), &buffer, got[0..stored]);
         for (model.kept[d][0..stored], got[0..stored]) |want, value| switch (want) {
             .bytes => |b| try testing.expectEqualSlices(u8, b, value.bytes),
             .numeric => |n| try testing.expectEqual(n, value.numeric),
         };
     }
+}
+
+/// The bodies of the files `out` holds: those held in memory checked whole;
+/// those read as they are asked for from memory, or from files on disk, read
+/// positionally and verified whole.
+fn bodiesOf(files: *Files, s: *shakedown.Source, out: *const write.Files, segment_number: u64) !segment.read.Bodies {
+    var bodies: segment.read.Bodies = undefined;
+    inline for (.{ "terms", "lengths", "ids", "columns" }) |name| {
+        const kind = @field(segment_files.Kind, name);
+        const e: segment_files.Expected = .{ .kind = kind, .segment = segment_number };
+        @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
+    }
+    const on_disk = gen.boolean(s);
+    inline for (.{ "postings", "positions", "store" }) |name| {
+        const kind = @field(segment_files.Kind, name);
+        const e: segment_files.Expected = .{ .kind = kind, .segment = segment_number };
+        if (on_disk) {
+            const file = try files.fileOf(out.of(kind));
+            var verify_buffer: [100]u8 = undefined;
+            try e.verify(io, file, &verify_buffer);
+            @field(bodies, name) = try e.open(io, file);
+        } else {
+            @field(bodies, name) = .{ .memory = (try e.check(.init(out.of(kind)))).bytes };
+        }
+    }
+    return bodies;
 }
 
 fn expectPostings(r: *segment.read.TermReader, want: []const ModelPosting, f: Schema.Field) !void {
@@ -224,10 +247,13 @@ fn expectPostings(r: *segment.read.TermReader, want: []const ModelPosting, f: Sc
 }
 
 test "a segment reads back as its documents: postings, positions, offsets, lengths and ids" {
-    try shakedown.check(testing.allocator, {}, againstModel, .{ .seed = 0x7365676d, .cases = 200 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, againstModel, .{ .seed = 0x7365676d, .cases = 200 });
 }
 
-fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
+fn anyBodies(files: *Files, case: *shakedown.Case) anyerror!void {
+    defer files.close();
     const s = case.source;
     const gpa = testing.allocator;
     var schema_buffer: [max_fields]Schema.Field = undefined;
@@ -235,18 +261,18 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
     var buffers: [7][128]u8 = undefined;
     const bodies: segment.read.Bodies = .{
         .terms = gen.bytesInto(s, &buffers[0]),
-        .postings = gen.bytesInto(s, &buffers[1]),
-        .positions = gen.bytesInto(s, &buffers[2]),
+        .postings = try files.source(gen.bytesInto(s, &buffers[1]), gen.boolean(s)),
+        .positions = try files.source(gen.bytesInto(s, &buffers[2]), gen.boolean(s)),
         .lengths = gen.bytesInto(s, &buffers[3]),
         .ids = gen.bytesInto(s, &buffers[4]),
         .columns = gen.bytesInto(s, &buffers[5]),
-        .store = gen.bytesInto(s, &buffers[6]),
+        .store = try files.source(gen.bytesInto(s, &buffers[6]), gen.boolean(s)),
     };
-    var seg = segment.read.Segment.parse(gpa, bodies, schema, 1 << 20) catch return;
+    var seg = segment.read.Segment.parse(gpa, io, bodies, schema, 1 << 20) catch return;
     defer seg.deinit(gpa);
     for (schema, 0..) |f, p| {
         const place: u32 = @intCast(p);
-        const found = seg.term(place, words[gen.intRange(s, usize, 0, words.len - 1)]) catch null;
+        const found = seg.term(io, place, words[gen.intRange(s, usize, 0, words.len - 1)]) catch null;
         if (found) |r| {
             var reader = r;
             while (reader.postings.next() catch null) |_| {}
@@ -263,5 +289,7 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
 }
 
 test "fuzz: any bodies are refused as a segment, or read within it" {
-    try shakedown.check(testing.allocator, {}, anyBodies, .{ .seed = 0x66757a7a, .cases = 3000 });
+    var files: Files = .init();
+    defer files.deinit();
+    try shakedown.check(testing.allocator, &files, anyBodies, .{ .seed = 0x66757a7a, .cases = 3000 });
 }

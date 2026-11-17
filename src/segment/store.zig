@@ -1,6 +1,8 @@
 //! A segment's stored fields: for each document, the values of the fields
 //! the schema stores, in blocks of about 16 KiB each compressed with LZ4
-//! (warp), so a document is read by decompressing one block.
+//! (warp), so a document is read by decompressing one block. The table is
+//! held in memory; a block is read from the `Source` when a document of it
+//! is asked for.
 //!
 //! A document's values, in the order of the stored fields: a text or
 //! keyword value as its length and its bytes, a numeric value as itself,
@@ -10,12 +12,15 @@
 //!     table        per block: its first document and its length decoded,
 //!                  u32 each, then where it starts in the data, u64, and
 //!                  its length there, u32, little endian
+//!     check        the CRC-32C of the blocks and the table, u32 little
+//!                  endian, so the table is checked whole when it is read
 //!     data         the blocks, each an LZ4 block
 //!
-//! What is read is checked: the table (first documents rising from zero,
-//! the blocks contiguous in the data, each no longer decoded than the
-//! caller's bound), a block's decoded length, and each value inside it.
-//! Bytes that break a rule are `error.Corrupt`.
+//! What is read is checked: the table (its CRC-32C, first documents
+//! rising from zero, the blocks contiguous in the data, each no longer
+//! decoded than the caller's bound nor longer compressed than its decoding
+//! allows), a block's decoded length, and each value inside it. Bytes that
+//! break a rule are `error.Corrupt`.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
@@ -23,10 +28,14 @@ const aegis = @import("aegis");
 const warp = @import("warp");
 const Schema = @import("../Schema.zig");
 const varint = @import("../encoding/varint.zig");
+const source_mod = @import("source.zig");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const Source = source_mod.Source;
+const Window = source_mod.Window;
 
-pub const Error = error{Corrupt};
+pub const Error = source_mod.Error;
 
 /// A block is closed once it holds this much.
 pub const block_bytes = 16 * 1024;
@@ -97,8 +106,12 @@ pub const Writer = struct {
     /// Appends the store's body to `out`.
     pub fn finish(w: *Writer, out: *std.ArrayList(u8)) Allocator.Error!void {
         try w.close();
+        const start = out.items.len;
         try varint.append(w.gpa, out, w.blocks);
         try out.appendSlice(w.gpa, w.table.items);
+        var check: [4]u8 = undefined;
+        std.mem.writeInt(u32, &check, warp.crc32c(0, out.items[start..]), .little);
+        try out.appendSlice(w.gpa, &check);
         try out.appendSlice(w.gpa, w.data.items);
     }
 };
@@ -111,34 +124,52 @@ const Entry = struct {
     len: u32,
 };
 
-/// A store read back, borrowing its body.
+/// A store read back: its table held, its blocks read from the source a
+/// block at a time.
 pub const Store = struct {
     docs: u32,
     fields: []const Schema.Field,
     blocks: u32,
     table: []const u8,
-    data: []const u8,
+    source: Source,
+    /// Where the blocks start in the body.
+    data_start: u64,
 
-    /// The store `body` holds for `docs` documents of `schema`, each block
-    /// decoding to at most `max_block` bytes.
-    pub fn parse(body: []const u8, docs: u32, schema: []const Schema.Field, max_block: u32) Error!Store {
+    /// The store in `source`, a store body, for `docs` documents of
+    /// `schema`, each block decoding to at most `max_block` bytes: its
+    /// table read on `io` into memory from `gpa`, and checked whole.
+    pub fn parse(gpa: Allocator, io: Io, source: Source, docs: u32, schema: []const Schema.Field, max_block: u32) (Error || Allocator.Error)!Store {
+        var window: Window = .init(source, io);
+        var head_buffer: [varint.max_bytes]u8 = undefined;
+        const head = try window.upTo(&head_buffer, 0, head_buffer.len, source.len());
         var at: usize = 0;
-        const blocks: u32 = @intCast(try varint.readAtMost(body, &at, docs));
-        const table_len = @as(usize, blocks) * entry_bytes;
-        if (table_len > body.len - at) return error.Corrupt;
-        const s: Store = .{ .docs = docs, .fields = schema, .blocks = blocks, .table = body[at..][0..table_len], .data = body[at + table_len ..] };
+        const blocks: u32 = @intCast(try varint.readAtMost(head, &at, docs));
+        const table_len = @as(u64, blocks) * entry_bytes;
+        const held = try source.alloc(io, gpa, at, table_len + 4);
+        errdefer gpa.free(held);
+        const table = held[0..@intCast(table_len)];
+        const crc = warp.crc32c(warp.crc32c(0, head[0..at]), table);
+        if (std.mem.readInt(u32, held[@intCast(table_len)..][0..4], .little) != crc) return error.Corrupt;
+        const s: Store = .{ .docs = docs, .fields = schema, .blocks = blocks, .table = held, .source = source, .data_start = at + table_len + 4 };
+        const data_len = source.len() - s.data_start;
         var expected: u64 = 0;
         var before: ?u32 = null;
         for (0..blocks) |b| {
             const e = s.entry(@intCast(b));
             if (if (before) |f| e.first <= f else e.first != 0) return error.Corrupt;
-            if (e.first >= docs or e.raw > max_block or e.start != expected) return error.Corrupt;
+            if (e.first >= docs or e.raw > max_block or e.len > warp.lz4.blockBound(max_block)) return error.Corrupt;
+            if (e.start != expected) return error.Corrupt;
             expected += e.len;
-            if (expected > s.data.len) return error.Corrupt;
+            if (expected > data_len) return error.Corrupt;
             before = e.first;
         }
-        if (expected != s.data.len or (blocks == 0) != (docs == 0)) return error.Corrupt;
+        if (expected != data_len or (blocks == 0) != (docs == 0)) return error.Corrupt;
         return s;
+    }
+
+    pub fn deinit(s: *Store, gpa: Allocator) void {
+        gpa.free(s.table);
+        s.* = undefined;
     }
 
     fn entry(s: Store, block: u32) Entry {
@@ -151,9 +182,10 @@ pub const Store = struct {
         };
     }
 
-    /// `doc`'s stored values, one per stored field, in `out`; the bytes ones
-    /// point into `buffer`, which holds the decoded block afterwards.
-    pub fn read(s: Store, gpa: Allocator, doc: u32, buffer: *std.ArrayList(u8), out: []Value) (Error || Allocator.Error)!void {
+    /// `doc`'s stored values, one per stored field, in `out`, its block read
+    /// on `io`; the bytes ones point into `buffer`, which holds the decoded
+    /// block afterwards.
+    pub fn read(s: Store, io: Io, gpa: Allocator, doc: u32, buffer: *std.ArrayList(u8), out: []Value) (Error || Allocator.Error)!void {
         aegis.assert.invariant(doc < s.docs, "a doc id is below the segment's documents");
         var slots: usize = 0;
         for (s.fields) |f| slots += @intFromBool(f.stored);
@@ -167,9 +199,16 @@ pub const Store = struct {
         }
         const e = s.entry(lo);
         const end_doc = if (lo + 1 < s.blocks) s.entry(lo + 1).first else s.docs;
-        try buffer.resize(gpa, e.raw);
-        const decoded = warp.lz4.decompressBlock(s.data[@intCast(e.start)..][0..e.len], buffer.items, .{}) catch return error.Corrupt;
+        // The compressed block is read in after the room for its decoding,
+        // then the buffer is cut to the decoded block.
+        try buffer.resize(gpa, @as(usize, e.raw) + e.len);
+        // A refused block leaves the buffer empty.
+        errdefer buffer.clearRetainingCapacity();
+        const compressed = buffer.items[e.raw..];
+        try s.source.read(io, s.data_start + e.start, compressed);
+        const decoded = warp.lz4.decompressBlock(compressed, buffer.items[0..e.raw], .{}) catch return error.Corrupt;
         if (decoded.out_len != e.raw) return error.Corrupt;
+        buffer.shrinkRetainingCapacity(e.raw);
         var at: usize = 0;
         var d = e.first;
         while (d < end_doc) : (d += 1) {
