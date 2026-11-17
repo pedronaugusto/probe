@@ -8,6 +8,9 @@
 //! positions from the word's own, which the whole word shares with its
 //! first part, so a phrase of parts (`parse span`) finds the identifier
 //! (`parseSpan`), and the next word's position follows the last part's.
+//! This is Lucene's shape for an original kept beside its parts, with no
+//! token graph: a query's text goes through the same analysis, so its
+//! phrases meet the field's through the parts.
 //!
 //! A term is cut to the caller's buffer, never inside a code point; a word
 //! whose fold is empty gives no token but keeps its position.
