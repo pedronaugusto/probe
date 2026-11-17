@@ -2,7 +2,8 @@
 const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
-    .{ .name = "encoding", .patterns = &.{"src/encoding/bitpack.zig"} },
+    .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig" } },
+    .{ .name = "encoding entry", .patterns = &.{"src/encoding.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
 
@@ -25,5 +26,7 @@ pub const references: []const gantry.rules.ReferenceRule = &package_references;
 /// Every production source, so a file added without a layer is refused.
 pub const required = [_][]const u8{
     "src/encoding/bitpack.zig",
+    "src/encoding/fst.zig",
+    "src/encoding.zig",
     "src/probe.zig",
 };

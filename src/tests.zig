@@ -5,4 +5,5 @@ const probe = @import("probe.zig");
 test {
     std.testing.refAllDecls(probe);
     _ = @import("bitpack_test.zig");
+    _ = @import("fst_test.zig");
 }
