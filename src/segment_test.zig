@@ -8,6 +8,7 @@ const segment = @import("segment.zig");
 const Schema = @import("Schema.zig");
 const Pipeline = @import("analysis.zig").Pipeline;
 const Files = @import("sources_test.zig").Files;
+const Opened = @import("Opened.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
@@ -144,8 +145,9 @@ fn againstModel(files: *Files, case: *shakedown.Case) anyerror!void {
     const segment_number = gen.int(s, u64);
     var out = try builder.finish(segment_number);
     defer out.deinit(gpa);
-    var seg = try segment.read.Segment.parse(gpa, io, try bodiesOf(files, s, &out, segment_number), schema, 1 << 20);
-    defer seg.deinit(gpa);
+    var held = try Held.open(files, s, out.items, segment_number, schema, docs);
+    defer held.deinit();
+    const seg = held.segmentOf();
     try testing.expectEqual(docs, seg.docs);
 
     for (schema, 0..) |f, p| {
@@ -170,7 +172,7 @@ fn againstModel(files: *Files, case: *shakedown.Case) anyerror!void {
             for (0..docs) |d| try testing.expectEqual(model.numbers[p][d], try cursor.get(@intCast(d)));
         }
     }
-    try expectIds(&seg, model.ids[0..docs]);
+    try expectIds(seg, model.ids[0..docs]);
 
     // Each document's stored values.
     var stored: usize = 0;
@@ -212,28 +214,38 @@ fn expectIds(seg: *const segment.read.Segment, ids: []const u64) !void {
 /// The bodies of the files `out` holds: those held in memory checked whole;
 /// those read as they are asked for from memory, or from files on disk, read
 /// positionally and verified whole.
-fn bodiesOf(files: *Files, s: *shakedown.Source, out: *const write.Files, segment_number: u64) !segment.read.Bodies {
-    var bodies: segment.read.Bodies = undefined;
-    inline for (.{ "terms", "lengths", "ids", "columns" }) |name| {
-        const kind = @field(segment_files.Kind, name);
-        const e: segment_files.Expected = .{ .kind = kind, .segment = segment_number };
-        @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
+/// A segment read back: checked from memory, or written to a directory
+/// and opened from its file as an index opens it.
+const Held = union(enum) {
+    memory: segment.read.Segment,
+    disk: Opened,
+
+    fn open(files: *Files, s: *shakedown.Source, file: []const u8, number: u64, schema: []const Schema.Field, docs: u32) !Held {
+        const gpa = testing.allocator;
+        if (gen.boolean(s)) {
+            var name_buffer: [segment_files.max_name_bytes]u8 = undefined;
+            const name = segment_files.name(&name_buffer, number, .segment, 0);
+            try files.tmp.dir.writeFile(io, .{ .sub_path = name, .data = file });
+            return .{ .disk = try Opened.open(gpa, io, files.tmp.dir, schema, .{ .number = number, .docs = docs }, 1 << 20) };
+        }
+        const e: segment_files.Expected = .{ .kind = .segment, .segment = number };
+        return .{ .memory = try segment.read.Segment.parse(gpa, io, segment.read.inMemory(try e.checkSegment(.init(file))), schema, 1 << 20) };
     }
-    const on_disk = gen.boolean(s);
-    inline for (.{ "postings", "positions", "store" }) |name| {
-        const kind = @field(segment_files.Kind, name);
-        const e: segment_files.Expected = .{ .kind = kind, .segment = segment_number };
-        if (on_disk) {
-            const file = try files.fileOf(out.of(kind));
-            var verify_buffer: [100]u8 = undefined;
-            try e.verify(io, file, &verify_buffer);
-            @field(bodies, name) = try e.open(io, file);
-        } else {
-            @field(bodies, name) = .{ .memory = (try e.check(.init(out.of(kind)))).bytes };
+
+    fn segmentOf(h: *const Held) *const segment.read.Segment {
+        return switch (h.*) {
+            .memory => |*m| m,
+            .disk => |*d| &d.segment,
+        };
+    }
+
+    fn deinit(h: *Held) void {
+        switch (h.*) {
+            .memory => |*m| m.deinit(testing.allocator),
+            .disk => |*d| d.deinit(testing.allocator, io),
         }
     }
-    return bodies;
-}
+};
 
 fn expectPostings(r: *segment.read.TermReader, want: []const ModelPosting, f: Schema.Field) !void {
     var block: u32 = 0;
@@ -316,17 +328,8 @@ test "an id's earlier documents that lie are refused: one not before its later, 
     for ([_]u64{ 5, 5, 9, 5 }) |id| _ = try builder.add(.{ .id = id, .values = &.{.{ .keyword = "a" }} });
     var out = try builder.finish(1);
     defer out.deinit(gpa);
-    var bodies: segment.read.Bodies = undefined;
-    inline for (.{ "terms", "lengths", "ids", "columns" }) |name| {
-        const kind = @field(segment_files.Kind, name);
-        const e: segment_files.Expected = .{ .kind = kind, .segment = 1 };
-        @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
-    }
-    inline for (.{ "postings", "positions", "store" }) |name| {
-        const kind = @field(segment_files.Kind, name);
-        const e: segment_files.Expected = .{ .kind = kind, .segment = 1 };
-        @field(bodies, name) = .{ .memory = (try e.check(.init(out.of(kind)))).bytes };
-    }
+    const e: segment_files.Expected = .{ .kind = .segment, .segment = 1 };
+    var bodies = segment.read.inMemory(try e.checkSegment(.init(out.items)));
     // The ids body: 4, four ids, 2, then the pairs (1, 0) and (3, 1).
     const ids = try gpa.dupe(u8, bodies.ids);
     defer gpa.free(ids);
@@ -359,4 +362,23 @@ test "an id's earlier documents that lie are refused: one not before its later, 
     @memcpy(ids[pairs..][0..8], ids[pairs + 8 ..][0..8]);
     ids[pairs + 8 ..][0..8].* = first;
     try testing.expectError(error.Corrupt, segment.read.Segment.parse(gpa, io, bodies, &schema, 1 << 20));
+}
+
+test "a segment whose ids are damaged on disk is refused when opened, by their checksum alone" {
+    const gpa = testing.allocator;
+    var files: Files = .init();
+    defer files.deinit();
+    const schema = [_]Schema.Field{.{ .name = "k", .kind = .keyword }};
+    var builder: write.Builder = try .init(gpa, &schema, 255);
+    defer builder.deinit();
+    _ = try builder.add(.{ .id = 1, .values = &.{.{ .keyword = "a" }} });
+    var out = try builder.finish(3);
+    defer out.deinit(gpa);
+    // A byte of the one document's id: its section parses as well as before.
+    const e: segment_files.Expected = .{ .kind = .segment, .segment = 3 };
+    const ids = (try e.checkSegment(.init(out.items)))[@backingInt(segment_files.Section.ids)];
+    out.items[@intFromPtr(ids.ptr) - @intFromPtr(out.items.ptr) + 1] ^= 0xff;
+    var name_buffer: [segment_files.max_name_bytes]u8 = undefined;
+    try files.tmp.dir.writeFile(io, .{ .sub_path = segment_files.name(&name_buffer, 3, .segment, 0), .data = out.items });
+    try testing.expectError(error.Corrupt, Opened.open(gpa, io, files.tmp.dir, &schema, .{ .number = 3, .docs = 1 }, 1 << 20));
 }

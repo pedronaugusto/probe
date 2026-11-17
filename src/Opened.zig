@@ -1,8 +1,9 @@
 //! A segment opened from its index's directory, as a manifest names it:
-//! the files read whole held as their checked bodies (the term dictionary,
-//! the lengths, the ids, the columns, and its deletions), the files read as
-//! they are asked for held open (the postings, the positions, the store),
-//! and the segment parsed over them.
+//! its file held open, the sections read whole held in memory, each checked
+//! by its CRC-32C (the term dictionary, the lengths, the ids, the columns),
+//! the sections read as they are asked for read from the file (the
+//! postings, the positions, the store), its deletions file read whole, and
+//! the segment parsed over them.
 //!
 //! A file the manifest names that is not there is `error.NotFound`: a
 //! reader that read a manifest older than the writer's retention opens the
@@ -32,14 +33,13 @@ fn closeFile(f: *Io.File, io: Io) void {
     f.close(io);
 }
 
-/// The kinds read whole, and those read as they are asked for.
-const whole_kinds = [_]files.Kind{ .terms, .lengths, .ids, .columns };
-const positional_kinds = [_]files.Kind{ .postings, .positions, .store };
+/// The sections read whole, and those read as they are asked for.
+const whole_sections = [_]files.Section{ .terms, .lengths, .ids, .columns };
 
 entry: Manifest.Segment,
-/// Each whole file's bytes, its header and footer included.
-whole: [whole_kinds.len][]u8,
-held: [positional_kinds.len]File,
+file: File,
+/// Each whole section's bytes.
+whole: [whole_sections.len][]u8,
 /// The deletions file's bytes, when the segment has one, and its view.
 deletion_bytes: ?[]u8,
 deletions: ?bitmap.View,
@@ -50,31 +50,39 @@ segment: layer.read.Segment,
 pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, entry: Manifest.Segment, max_block: u32) OpenError!Opened {
     var o: Opened = undefined;
     o.entry = entry;
+    // Read through the handle itself: its owner binds where it is first
+    // used, and the segment is used where it is moved to.
+    const file = try openFile(io, dir, entry.number, .segment, 0);
+    o.file = .init(file);
+    errdefer o.file.deinit(io);
+    const expected: files.Expected = .{ .kind = .segment, .segment = entry.number };
+    const table = try expected.openSegment(io, file);
+    const len = file.length(io) catch |err| return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.ReadFailed,
+    };
+    const whole_file: source.Source = .{ .file = .{ .file = .of(file), .start = 0, .len = len } };
     var read_whole: usize = 0;
     errdefer for (o.whole[0..read_whole]) |bytes| gpa.free(bytes);
     var bodies: layer.read.Bodies = undefined;
-    inline for (whole_kinds, 0..) |kind, i| {
-        o.whole[i] = try readWhole(gpa, io, dir, entry.number, kind, 0);
+    inline for (whole_sections, 0..) |section, i| {
+        const e = table.of(section);
+        o.whole[i] = try whole_file.alloc(io, gpa, e.offset, e.len);
         read_whole += 1;
-        const e: files.Expected = .{ .kind = kind, .segment = entry.number };
-        @field(bodies, @tagName(kind)) = (try e.check(.init(o.whole[i]))).bytes;
+        try table.checkSection(section, o.whole[i]);
+        @field(bodies, @tagName(section)) = o.whole[i];
     }
-    var opened: usize = 0;
-    errdefer for (o.held[0..opened]) |*f| f.deinit(io);
-    inline for (positional_kinds, 0..) |kind, i| {
-        // Read through the handle itself: its owner binds where it is first
-        // used, and the segment is used where it is moved to.
-        const file = try openFile(io, dir, entry.number, kind, 0);
-        o.held[i] = .init(file);
-        opened += 1;
-        const e: files.Expected = .{ .kind = kind, .segment = entry.number };
-        @field(bodies, @tagName(kind)) = try e.open(io, file);
+    inline for (.{ .postings, .positions, .store }) |section| {
+        const e = table.of(section);
+        @field(bodies, @tagName(section)) = .{ .file = .{ .file = .of(file), .start = e.offset, .len = e.len } };
     }
     o.deletion_bytes = null;
     o.deletions = null;
     errdefer if (o.deletion_bytes) |bytes| gpa.free(bytes);
     if (entry.deletions) |d| {
-        const bytes = try readWhole(gpa, io, dir, entry.number, .deletions, d.generation);
+        const del = try openFile(io, dir, entry.number, .deletions, d.generation);
+        defer del.close(io);
+        const bytes = try source.readWhole(io, del, gpa);
         o.deletion_bytes = bytes;
         const e: files.Expected = .{ .kind = .deletions, .segment = entry.number };
         const view = bitmap.View.parse((try e.check(.init(bytes))).bytes, entry.docs) catch return error.Corrupt;
@@ -97,7 +105,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, e
 pub fn deinit(o: *Opened, gpa: Allocator, io: Io) void {
     o.segment.deinit(gpa);
     for (o.whole) |bytes| gpa.free(bytes);
-    for (&o.held) |*f| f.deinit(io);
+    o.file.deinit(io);
     if (o.deletion_bytes) |bytes| gpa.free(bytes);
     o.* = undefined;
 }
@@ -115,10 +123,4 @@ fn openFile(io: Io, dir: Io.Dir, number: u64, kind: files.Kind, generation: u64)
         error.Canceled => error.Canceled,
         else => error.ReadFailed,
     };
-}
-
-fn readWhole(gpa: Allocator, io: Io, dir: Io.Dir, number: u64, kind: files.Kind, generation: u64) OpenError![]u8 {
-    const file = try openFile(io, dir, number, kind, generation);
-    defer file.close(io);
-    return source.readWhole(io, file, gpa);
 }

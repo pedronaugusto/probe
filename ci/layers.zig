@@ -26,7 +26,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
     .{
         .name = "named dependencies",
         .unresolved_only = true,
-        .except_targets = &.{ "std", "aegis", "xenoglyph", "warp", "strand", "airlock", "shakedown", "builtin" },
+        .except_targets = &.{ "std", "aegis", "xenoglyph", "warp", "strand", "airlock", "airlock.testing", "shakedown", "builtin" },
     },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
 };

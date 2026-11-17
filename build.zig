@@ -1,4 +1,5 @@
 const std = @import("std");
+const airlock_build = @import("airlock");
 
 /// What a project that depends on probe builds: the `probe` module, on
 /// aegis, xenoglyph, warp, strand and airlock. The tests, checks and gate are `dev`'s.
@@ -32,6 +33,8 @@ pub fn dev(b: *std.Build, tools: type) void {
         .imports = &.{.{ .name = "shakedown", .module = shakedown.module("shakedown") }},
     });
     addSourceImports(p, test_module, target, optimize);
+    // airlock's seam on shakedown, for the crash tests.
+    test_module.addImport("airlock.testing", airlock_build.testing(p.dependency("airlock", .{ .target = target, .optimize = optimize }), shakedown.module("shakedown")));
     const tests = b.addTest(.{ .name = "probe-tests", .filters = filters, .root_module = test_module });
     const check = b.step("check", "Compile the tests without running them");
     const test_step = b.step("test", "Run the tests");

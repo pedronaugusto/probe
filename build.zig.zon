@@ -18,8 +18,8 @@
             .hash = "warp-0.4.5-JASxFVb9MAB4RR4raR3s-M3_KijNneBhD4RtjFOFn921",
         },
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#3b521893a0cd2e91c4724d2bbc05848a43972a78",
-            .hash = "strand-0.15.0-8LNWVs2dNwAUUxHJE0TrcXd-rO4EGm7paRc3lKe1ppzt",
+            .url = "git+https://github.com/pedronaugusto/strand#a49e6c50e42630166c060b36438871cc28f649a1",
+            .hash = "strand-0.15.0-8LNWVmWyNwBJCxiXMsa5EE8LNwF_9akRcDV19MCCpTJ0",
         },
         .airlock = .{
             .url = "git+https://github.com/pedronaugusto/airlock#3ef2f541e9c487e62dd588d5675199d77bbca1ec",

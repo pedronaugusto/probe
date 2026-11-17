@@ -1,6 +1,7 @@
 //! A segment built in memory, document by document, then written as its
-//! files, each framed by `files`: the term dictionary, the postings, the
-//! positions, the lengths, the ids and the numeric columns.
+//! file (`files.appendSegment`), one section each for the term dictionary,
+//! the postings, the positions, the lengths, the numeric columns, the ids
+//! and the stored fields.
 //!
 //! A document comes as its values, one per field of the schema in order,
 //! and its id. A text field's value is analyzed (`analysis/Pipeline.zig`)
@@ -9,7 +10,7 @@
 //! keyword field's value is one term, its bytes cut to the longest term. A
 //! document's length in a text field is its count of tokens there.
 //!
-//! The bodies:
+//! The sections:
 //!
 //!     lengths   the text fields, a varint; per text field, rising by
 //!               place: its place, a varint, the sum of its lengths, u64,
@@ -55,41 +56,6 @@ pub const Value = union(enum) {
 pub const Document = struct {
     id: u64,
     values: []const Value,
-};
-
-/// A segment's files, each whole: header, body and footer.
-pub const Files = struct {
-    terms: std.ArrayList(u8) = .empty,
-    postings: std.ArrayList(u8) = .empty,
-    positions: std.ArrayList(u8) = .empty,
-    lengths: std.ArrayList(u8) = .empty,
-    ids: std.ArrayList(u8) = .empty,
-    columns: std.ArrayList(u8) = .empty,
-    store: std.ArrayList(u8) = .empty,
-
-    pub fn deinit(f: *Files, gpa: Allocator) void {
-        f.store.deinit(gpa);
-        f.terms.deinit(gpa);
-        f.postings.deinit(gpa);
-        f.positions.deinit(gpa);
-        f.lengths.deinit(gpa);
-        f.ids.deinit(gpa);
-        f.columns.deinit(gpa);
-    }
-
-    /// The file of `kind`.
-    pub fn of(f: *const Files, kind: files.Kind) []const u8 {
-        return switch (kind) {
-            .terms => f.terms.items,
-            .postings => f.postings.items,
-            .positions => f.positions.items,
-            .lengths => f.lengths.items,
-            .ids => f.ids.items,
-            .columns => f.columns.items,
-            .store => f.store.items,
-            .deletions => &.{},
-        };
-    }
 };
 
 /// A term's postings and tokens being gathered.
@@ -219,11 +185,9 @@ pub const Builder = struct {
         if (token) |tk| try t.tokens.append(b.gpa, tk);
     }
 
-    /// The segment's files, as segment `segment`.
-    pub fn finish(b: *Builder, segment: u64) Allocator.Error!Files {
+    /// The segment's file, as segment `segment`: its bytes, the caller's.
+    pub fn finish(b: *Builder, segment: u64) Allocator.Error!std.ArrayList(u8) {
         const gpa = b.gpa;
-        var out: Files = .{};
-        errdefer out.deinit(gpa);
         var dictionary: std.ArrayList(u8) = .empty;
         defer dictionary.deinit(gpa);
         var post: std.ArrayList(u8) = .empty;
@@ -255,12 +219,6 @@ pub const Builder = struct {
         defer ids.deinit(gpa);
         try b.writeIds(&ids);
 
-        try frame(gpa, &out.terms, .terms, segment, dictionary.items);
-        try frame(gpa, &out.postings, .postings, segment, post.items);
-        try frame(gpa, &out.positions, .positions, segment, pos.items);
-        try frame(gpa, &out.lengths, .lengths, segment, lengths.items);
-        try frame(gpa, &out.ids, .ids, segment, ids.items);
-
         var cols: std.ArrayList(u8) = .empty;
         defer cols.deinit(gpa);
         var column: std.ArrayList(u8) = .empty;
@@ -276,12 +234,22 @@ pub const Builder = struct {
             try varint.append(gpa, &cols, column.items.len);
             try cols.appendSlice(gpa, column.items);
         }
-        try frame(gpa, &out.columns, .columns, segment, cols.items);
 
         var stored: std.ArrayList(u8) = .empty;
         defer stored.deinit(gpa);
         try b.store.finish(&stored);
-        try frame(gpa, &out.store, .store, segment, stored.items);
+
+        var sections: files.Sections = undefined;
+        sections[@backingInt(files.Section.terms)] = dictionary.items;
+        sections[@backingInt(files.Section.postings)] = post.items;
+        sections[@backingInt(files.Section.positions)] = pos.items;
+        sections[@backingInt(files.Section.lengths)] = lengths.items;
+        sections[@backingInt(files.Section.columns)] = cols.items;
+        sections[@backingInt(files.Section.ids)] = ids.items;
+        sections[@backingInt(files.Section.store)] = stored.items;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        try files.appendSegment(gpa, &out, segment, &sections);
         return out;
     }
 
@@ -388,13 +356,4 @@ fn appendInt(gpa: Allocator, out: *std.ArrayList(u8), comptime T: type, value: T
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);
     try out.appendSlice(gpa, &bytes);
-}
-
-fn frame(gpa: Allocator, out: *std.ArrayList(u8), kind: files.Kind, segment: u64, body: []const u8) Allocator.Error!void {
-    const header = files.header(kind, segment);
-    try out.ensureTotalCapacityPrecise(gpa, files.header_bytes + body.len + files.footer_bytes);
-    out.appendSliceAssumeCapacity(&header);
-    out.appendSliceAssumeCapacity(body);
-    const footer = files.footer(files.crc32c(0, out.items));
-    out.appendSliceAssumeCapacity(&footer);
 }

@@ -1,7 +1,7 @@
-//! A segment read back from its files: the term dictionary, the lengths,
-//! the ids and the columns held in memory, each body already checked by
-//! `files.Expected.check`; the postings, positions and stored blocks read
-//! from their files as they are asked for (`source.zig`). It gives the
+//! A segment read back from its file's sections: the term dictionary, the
+//! lengths, the ids and the columns held in memory, each already checked
+//! by its CRC-32C; the postings, positions and stored blocks read from the
+//! file as they are asked for (`source.zig`). It gives the
 //! postings and positions a term's addresses lead to, each document's
 //! length in each text field, the ids, each numeric field's column, and
 //! each document's stored values.
@@ -22,6 +22,7 @@ const terms = @import("terms.zig");
 const columns = @import("columns.zig");
 const store = @import("store.zig");
 const source_mod = @import("source.zig");
+const files = @import("files.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -40,6 +41,24 @@ pub const Bodies = struct {
     positions: Source,
     store: Source,
 };
+
+/// The bodies of a segment held in memory whole, its sections checked.
+pub fn inMemory(sections: files.Sections) Bodies {
+    const of = struct {
+        fn of(s: files.Sections, section: files.Section) []const u8 {
+            return s[@backingInt(section)];
+        }
+    }.of;
+    return .{
+        .terms = of(sections, .terms),
+        .lengths = of(sections, .lengths),
+        .ids = of(sections, .ids),
+        .columns = of(sections, .columns),
+        .postings = .{ .memory = of(sections, .postings) },
+        .positions = .{ .memory = of(sections, .positions) },
+        .store = .{ .memory = of(sections, .store) },
+    };
+}
 
 /// A term's postings, and its positions when its field keeps them.
 pub const TermReader = struct {

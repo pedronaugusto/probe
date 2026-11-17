@@ -8,17 +8,22 @@
 //! lock nobody else writes there, so the temporary files a dead writer left
 //! are removed at open, however new.
 //!
+//! The directory is the caller's, made durably before the writer opens it
+//! (`airlock.makePath`): a writer makes what it puts in the directory
+//! durable, never the directory's own name in its parent.
+//!
 //! Documents are gathered in a segment being built until `refresh`, or
 //! until their bytes pass `Options.buffer_bytes`, closes it in memory. A
 //! delete marks every document of its id in the segments there are and,
 //! for the segment being built, every document added before it. `commit`
-//! writes the new segments' files and each changed deletion bitmap as
+//! writes each new segment's file and each changed deletion bitmap as
 //! airlock pendings, then after a fence the new manifest, and commits them
 //! in one batch at `Options.durability`: the files reach the disk before
 //! the manifest that names them, so a crash leaves the commit before or
 //! this one, whole. It then removes the manifests past the last
-//! `Options.keep_commits` and every file none of those names; a removal
-//! that fails is left to the next commit or the next writer's open.
+//! `Options.keep_commits` and every file none of those names, then syncs
+//! the directory once; a removal that fails is left to the next commit or
+//! the next writer's open.
 //!
 //! A segment whose every document is deleted leaves the next manifest. What
 //! is not committed when the writer closes is dropped.
@@ -108,15 +113,15 @@ const Live = struct {
     }
 };
 
-/// A segment built since the last commit: its files' bytes, and the
+/// A segment built since the last commit: its file's bytes, and the
 /// segment read over them.
 const Fresh = struct {
-    files: write.Files,
+    file: std.ArrayList(u8),
     segment: read.Segment,
 
     fn deinit(f: *Fresh, gpa: Allocator) void {
         f.segment.deinit(gpa);
-        f.files.deinit(gpa);
+        f.file.deinit(gpa);
     }
 };
 
@@ -281,23 +286,15 @@ pub fn refresh(w: *Writer, io: Io) AddError!void {
     const number = w.next_segment;
     var out = try b.finish(number);
     errdefer out.deinit(w.gpa);
-    var bodies: read.Bodies = undefined;
-    inline for (.{ "terms", "lengths", "ids", "columns", "postings", "positions", "store" }) |name| {
-        const kind = @field(files.Kind, name);
-        const e: files.Expected = .{ .kind = kind, .segment = number };
-        // The bytes were written here a moment ago: a refusal is a bug.
-        const body = (e.check(.init(out.of(kind))) catch aegis.assert.never("a segment just built reads back")).bytes;
-        @field(bodies, name) = switch (@FieldType(read.Bodies, name)) {
-            []const u8 => body,
-            else => .{ .memory = body },
-        };
-    }
-    var seg = read.Segment.parse(w.gpa, io, bodies, w.schema, w.options.max_block) catch |err| switch (err) {
+    // The bytes were written here a moment ago: a refusal is a bug.
+    const e: files.Expected = .{ .kind = .segment, .segment = number };
+    const sections = e.checkSegment(.init(out.items)) catch aegis.assert.never("a segment just built reads back");
+    var seg = read.Segment.parse(w.gpa, io, read.inMemory(sections), w.schema, w.options.max_block) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => aegis.assert.never("a segment just built reads back"),
     };
     errdefer seg.deinit(w.gpa);
-    var live: Live = .{ .number = number, .docs = b.docs, .held = .{ .fresh = .{ .files = out, .segment = seg } }, .committed = false };
+    var live: Live = .{ .number = number, .docs = b.docs, .held = .{ .fresh = .{ .file = out, .segment = seg } }, .committed = false };
     errdefer if (live.deleted) |*d| d.deinit(w.gpa);
     for (w.buffered.items) |d| {
         var docs = try seg.docsOf(d.id);
@@ -327,11 +324,10 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
     var entries: std.ArrayList(Manifest.Segment) = .empty;
     for (w.live.items) |*l| {
         if (l.deleted_count == l.docs) continue;
-        if (!l.committed) inline for (.{ "terms", "postings", "positions", "lengths", "columns", "ids", "store" }) |name| {
-            const kind = @field(files.Kind, name);
-            try names.append(a, try fileName(a, l.number, kind, 0));
-            try contents.append(a, l.held.fresh.files.of(kind));
-        };
+        if (!l.committed) {
+            try names.append(a, try fileName(a, l.number, .segment, 0));
+            try contents.append(a, l.held.fresh.file.items);
+        }
         var entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
         if (l.deleted_count > 0) {
             if (l.changed) {
@@ -464,7 +460,7 @@ fn prune(w: *Writer, io: Io) PruneError!void {
             else => return error.ReadFailed,
         };
         for (m.segments) |s| {
-            try named.put(a, .{ .segment = s.number, .kind = .terms }, {});
+            try named.put(a, .{ .segment = s.number, .kind = .segment }, {});
             if (s.deletions) |d| try named.put(a, .{ .segment = s.number, .kind = .deletions, .generation = d.generation }, {});
         }
     }
@@ -474,10 +470,17 @@ fn prune(w: *Writer, io: Io) PruneError!void {
     it = dir.iterate();
     while (it.next(io) catch |err| return pruneListed(err)) |entry| {
         const n = files.parseName(entry.name) orelse continue;
-        const key: files.Named = if (n.kind == .deletions) n else .{ .segment = n.segment, .kind = .terms };
-        if (!named.contains(key)) try gone.append(a, try a.dupe(u8, entry.name));
+        if (!named.contains(n)) try gone.append(a, try a.dupe(u8, entry.name));
     }
     for (gone.items) |name| try removeFile(io, dir, name);
+    // The removals made durable together, at the writer's level: one sync
+    // of the directory, not one per name.
+    if (generations.items.len > keep or gone.items.len > 0) {
+        _ = airlock.syncDir(io, dir, .{ .level = w.options.durability }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.WriteFailed,
+        };
+    }
 }
 
 fn pruneListed(err: Io.Dir.Iterator.Error) PruneError {

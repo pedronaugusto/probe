@@ -19,4 +19,5 @@ test {
     _ = @import("manifest_test.zig");
     _ = @import("sources_test.zig");
     _ = @import("writer_test.zig");
+    _ = @import("crash_test.zig");
 }
