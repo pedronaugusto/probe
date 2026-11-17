@@ -5,7 +5,8 @@
 //! query's best hits equal the reference's bit for bit in score and order,
 //! its count equals the reference's, and every score is within 1e-5 of
 //! BM25 computed apart in `f64`. A phrase's frequency equals the one found
-//! by trying every chain of positions.
+//! by trying every chain of positions. Over a segment whose sections are
+//! damaged, every query answers within the segment or is `Corrupt`.
 const std = @import("std");
 const shakedown = @import("shakedown");
 const Writer = @import("Writer.zig");
@@ -18,6 +19,7 @@ const exec = query.exec;
 const phrase = query.phrase;
 const Pipeline = @import("analysis/Pipeline.zig");
 const segment = @import("segment.zig");
+const Held = @import("Held.zig");
 const reference = @import("testing/reference.zig");
 
 const testing = std.testing;
@@ -521,4 +523,129 @@ test "the block-max conjunction passes a window that cannot beat the best held, 
     try testing.expectEqual(every[0].doc, hits[0].doc);
     try testing.expect(report.skipped > 0);
     try testing.expect(report.scored < 400);
+}
+
+/// What the damaged segment fuzz saw: segments refused when read, and
+/// queries answered or refused over the ones that read.
+var damaged_refused: u64 = 0;
+var damaged_answered: u64 = 0;
+var damaged_corrupt: u64 = 0;
+
+/// A segment's sections with 1 to 4 bytes changed, most often in the
+/// postings, which a reader reads as they are asked for and checks only
+/// as it reads them.
+fn damage(s: *shakedown.Source, file: []u8, sections: segment.files.Sections) void {
+    const section: segment.files.Section = switch (gen.intRange(s, u8, 0, 9)) {
+        0...5 => .postings,
+        6 => .terms,
+        7 => .lengths,
+        8 => .columns,
+        else => .store,
+    };
+    const body_bytes = sections[@backingInt(section)];
+    if (body_bytes.len == 0) return;
+    const start = @intFromPtr(body_bytes.ptr) - @intFromPtr(file.ptr);
+    for (0..gen.intRange(s, usize, 1, 4)) |_| {
+        const at = start + gen.intRange(s, usize, 0, body_bytes.len - 1);
+        file[at] ^= gen.intRange(s, u8, 1, 255);
+    }
+}
+
+/// A phrase of two to four terms of the body, which reads their
+/// positions.
+fn phraseOf(arena: std.mem.Allocator, s: *shakedown.Source) !Node {
+    const len = gen.intRange(s, usize, 2, 4);
+    const ts = try arena.alloc([]const u8, len);
+    const ps = try arena.alloc(u32, len);
+    for (ts, ps, 0..) |*t, *p, i| {
+        t.* = termOf(s);
+        p.* = @intCast(i);
+    }
+    return .{ .phrase = .{ .field = body, .terms = ts, .positions = ps, .slop = gen.intRange(s, u32, 0, 12) } };
+}
+
+fn damagedSegment(_: void, case: *shakedown.Case) anyerror!void {
+    const s = case.source;
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var builder: segment.write.Builder = try .init(gpa, &schema, 255);
+    defer builder.deinit();
+    const common = words[gen.intRange(s, usize, 0, words.len - 1)];
+    for (0..gen.intRange(s, usize, 1, 500)) |d| {
+        var serial_buffer: [20]u8 = undefined;
+        const values = [_]segment.write.Value{
+            .{ .text = try text(arena, s, gen.intRange(s, usize, 0, 12), common) },
+            .{ .text = try text(arena, s, gen.intRange(s, usize, 0, 3), null) },
+            .{ .keyword = tags[gen.intRange(s, usize, 0, tags.len - 1)] },
+            .{ .numeric = gen.intRange(s, u64, 0, 1500) },
+            .{ .keyword = try std.mem.print(&serial_buffer, "{d}", .{d}) },
+        };
+        _ = try builder.add(.{ .id = d, .values = &values });
+    }
+    var clean = try builder.finish(1);
+    defer clean.deinit(gpa);
+    for (0..16) |_| try queryDamaged(s, arena, try clean.clone(gpa), builder.docs);
+}
+
+/// Queries over the segment `owned` holds, damaged first; `owned` is freed
+/// here.
+fn queryDamaged(s: *shakedown.Source, arena: std.mem.Allocator, owned: std.ArrayList(u8), docs: u32) !void {
+    const gpa = testing.allocator;
+    var file = owned;
+    var file_owned = true;
+    defer if (file_owned) file.deinit(gpa);
+    const e: segment.files.Expected = .{ .kind = .segment, .segment = 1 };
+    const sections = try e.checkSegment(.init(file.items));
+    damage(s, file.items, sections);
+    var seg = segment.read.Segment.parse(gpa, io, segment.read.inMemory(sections), &schema, 1 << 20) catch |err| switch (err) {
+        error.Corrupt => {
+            damaged_refused += 1;
+            return;
+        },
+        else => |other| return other,
+    };
+    var seg_owned = true;
+    defer if (seg_owned) seg.deinit(gpa);
+    var held: Held.Handle = try .create(gpa, .{ .gpa = gpa, .io = io, .number = 1, .docs = docs, .from = .{ .memory = .{ .file = file, .segment = seg } } });
+    file_owned = false;
+    seg_owned = false;
+    defer held.release();
+    var segments = [_]Reader.Segment{.{ .held = held, .deleted = null, .deleted_count = 0, .deletions = .none }};
+    const r: Reader = .{ .gpa = gpa, .dir = .of(std.Io.Dir.cwd()), .schema = &schema, .options = .{}, .generation = 1, .segments = &segments };
+    for (0..4) |_| {
+        const root = switch (gen.intRange(s, u8, 0, 3)) {
+            0 => try queryOf(arena, s, 3),
+            1 => try disjunctionOf(arena, s),
+            2 => try conjunctionOf(arena, s),
+            else => try phraseOf(arena, s),
+        };
+        const order: exec.Order = if (gen.intRange(s, u8, 0, 3) == 0) .{ .column = .{ .field = n_field, .descending = gen.boolean(s) } } else .score;
+        const options: exec.Options = .{ .top = gen.intRange(s, u32, 1, 50), .order = order, .wand = gen.boolean(s) };
+        if (exec.search(gpa, io, &r, &root, options)) |hits| {
+            defer gpa.free(hits);
+            damaged_answered += 1;
+            for (hits) |h| try testing.expect(h.segment == 0 and h.doc < docs);
+        } else |err| switch (err) {
+            error.Corrupt => damaged_corrupt += 1,
+            error.TooManyTerms => {},
+            else => |other| return other,
+        }
+        if (exec.count(gpa, io, &r, &root, .{})) |n| {
+            try testing.expect(n <= docs);
+        } else |err| switch (err) {
+            error.Corrupt, error.TooManyTerms => {},
+            else => |other| return other,
+        }
+    }
+}
+
+test "fuzz: queries over a damaged segment answer within it or are Corrupt, never more" {
+    damaged_refused = 0;
+    damaged_answered = 0;
+    damaged_corrupt = 0;
+    try shakedown.check(testing.allocator, {}, damagedSegment, .{ .seed = 0x6461_6d67, .cases = 150 });
+    // Every outcome was reached: a segment refused, a query refused, one answered.
+    try testing.expect(damaged_refused > 0 and damaged_corrupt > 0 and damaged_answered > 0);
 }

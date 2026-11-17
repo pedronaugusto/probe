@@ -153,9 +153,7 @@ pub const Segment = struct {
             if (schema[place].kind != .numeric) return error.Corrupt;
             if (before) |b| if (place <= b) return error.Corrupt;
             before = place;
-            const len: usize = @intCast(try varint.readAtMost(body, &at, body.len - at));
-            out[place] = try columns.Column.parse(body[at..][0..len], docs);
-            at += len;
+            out[place] = try columns.Column.parse(try varint.readBytes(body, &at), docs);
         }
         if (at != body.len) return error.Corrupt;
     }

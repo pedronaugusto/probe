@@ -141,10 +141,8 @@ pub const Dictionary = struct {
     fn readField(body: []const u8, at: *usize, places: u32) Error!Field {
         const place: u32 = @intCast(try varint.readAtMost(body, at, places -| 1));
         const terms = try varint.readAtMost(body, at, body.len / entry_bytes);
-        const keys_len = try varint.readAtMost(body, at, body.len - at.*);
-        const keys = try fst.Fst.parse(body[at.*..][0..@intCast(keys_len)]);
+        const keys = try fst.Fst.parse(try varint.readBytes(body, at));
         if (keys.keys != terms) return error.Corrupt;
-        at.* += @intCast(keys_len);
         const table_len: usize = @intCast(terms * entry_bytes);
         if (table_len > body.len - at.*) return error.Corrupt;
         const table = body[at.*..][0..table_len];

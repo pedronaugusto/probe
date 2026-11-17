@@ -41,3 +41,14 @@ pub fn readAtMost(bytes: []const u8, at: *usize, max: u64) Error!u64 {
     if (value > max) return error.Corrupt;
     return value;
 }
+
+/// The bytes a length at `at.*` in `bytes` gives, those after it, with
+/// `at` moved past them. A length is bounded by the bytes left once it is
+/// read, so one longer than what follows it is refused.
+pub fn readBytes(bytes: []const u8, at: *usize) Error![]const u8 {
+    const len = try read(bytes, at);
+    if (len > bytes.len - at.*) return error.Corrupt;
+    const out = bytes[at.*..][0..@intCast(len)];
+    at.* += out.len;
+    return out;
+}

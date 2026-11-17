@@ -280,11 +280,6 @@ pub const Store = struct {
 fn readValue(raw: []const u8, at: *usize, kind: Schema.Kind) Error!Value {
     switch (kind) {
         .numeric => return .{ .numeric = try varint.read(raw, at) },
-        .text, .keyword => {
-            const len: usize = @intCast(try varint.readAtMost(raw, at, raw.len - at.*));
-            const bytes = raw[at.*..][0..len];
-            at.* += len;
-            return .{ .bytes = bytes };
-        },
+        .text, .keyword => return .{ .bytes = try varint.readBytes(raw, at) },
     }
 }

@@ -9,6 +9,7 @@ const Schema = @import("Schema.zig");
 const Pipeline = @import("analysis.zig").Pipeline;
 const Files = @import("sources_test.zig").Files;
 const Opened = @import("Opened.zig");
+const varint = @import("encoding/varint.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
@@ -317,6 +318,16 @@ test "fuzz: any bodies are refused as a segment, or read within it" {
     var files: Files = .init();
     defer files.deinit();
     try shakedown.check(testing.allocator, &files, anyBodies, .{ .seed = 0x66757a7a, .cases = 3000 });
+}
+
+test "a length is bounded by the bytes after it, not by those before it is read" {
+    // A length that the bytes after it hold exactly.
+    const bytes = [_]u8{ 2, 0xaa, 0xbb, 3, 0xcc, 0xdd };
+    var at: usize = 0;
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, try varint.readBytes(&bytes, &at));
+    try testing.expectEqual(@as(usize, 3), at);
+    // Three follow the length at 3 before it is read, two after.
+    try testing.expectError(error.Corrupt, varint.readBytes(&bytes, &at));
 }
 
 test "an id's earlier documents that lie are refused: one not before its later, of another id, or out of order" {

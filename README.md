@@ -77,8 +77,9 @@ the hit's place in the snapshot.
 Development runs through [bay](https://github.com/pedronaugusto/bay). `bay test` runs the
 suite; its properties, run by [shakedown](https://github.com/pedronaugusto/shakedown),
 pack and unpack any block at every width and read any bytes as a block within its bounds,
-and give every query the same best hits, bit for bit, as an exact reference that scores
-each document by the definition.
+give every query the same best hits, bit for bit, as an exact reference that scores
+each document by the definition, and run queries over segments with damaged bytes, each
+answering within the segment or refusing it as corrupt.
 
 ## Licence
 
