@@ -40,6 +40,14 @@ from: union(enum) {
     memory: Memory,
 },
 
+/// Its file's length.
+pub fn bytes(h: *const Held) u64 {
+    return switch (h.from) {
+        .file => |*o| o.bytes,
+        .memory => |*m| m.file.items.len,
+    };
+}
+
 pub fn read(h: *const Held) *const segment.read.Segment {
     return switch (h.from) {
         .file => |*o| &o.segment,

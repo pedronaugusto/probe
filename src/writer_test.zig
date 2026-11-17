@@ -95,7 +95,7 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     const options: Writer.Options = .{
         .keep_commits = keep,
         .buffer_bytes = gen.intRange(s, usize, 20, 400),
-        .merge = .{ .per_tier = gen.intRange(s, u8, 2, 3), .floor_docs = 1, .deleted_percent = 30 },
+        .merge = .{ .max_merged_bytes = gen.intRange(s, u64, 2_000, 40_000), .segments_per_tier = 2, .max_merge_at_once = gen.intRange(s, u8, 2, 3), .floor_bytes = 1, .deletes_pct_allowed = 20 },
     };
     var w: Writer = try .open(gpa, io, tmp.dir, &schema, options);
     defer w.deinit(io);

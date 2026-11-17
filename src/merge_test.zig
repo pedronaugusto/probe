@@ -2,8 +2,8 @@
 //! documents dropped, are byte for byte the segment built from their live
 //! documents in order, since one writer writes both. A source whose
 //! postings or stored blocks have any one bit changed refuses the merge,
-//! naming the segment and the section. The policy merges a full tier's
-//! smallest, or a segment mostly deleted.
+//! naming the segment and the section. The policy keeps every merge within
+//! its cap and the index within its tier and deletes budget.
 const std = @import("std");
 const shakedown = @import("shakedown");
 const merge = @import("merge.zig");
@@ -214,15 +214,104 @@ test "a source with one bit of its postings or stored blocks changed refuses the
     try shakedown.check(testing.allocator, {}, flipped, .{ .seed = 0x666c6970, .cases = 400 });
 }
 
-test "the policy merges a full tier's smallest, else a segment mostly deleted" {
-    const p: merge.Policy = .{ .per_tier = 3, .floor_docs = 10, .deleted_percent = 50 };
+const Size = merge.Policy.Size;
+
+/// The segments `merged` takes the place of, as one segment of their live
+/// documents and bytes.
+fn applied(sizes: *std.ArrayList(Size), merged: []const usize) Size {
+    var into: Size = .{ .bytes = 0, .docs = 0, .deleted = 0 };
+    var i = merged.len;
+    while (i > 0) {
+        i -= 1;
+        const s = sizes.orderedRemove(merged[i]);
+        into.bytes += merge.Policy.liveBytes(s);
+        into.docs += s.docs - s.deleted;
+    }
+    return into;
+}
+
+fn policyHolds(_: void, case: *shakedown.Case) anyerror!void {
+    const s = case.source;
+    const gpa = testing.allocator;
+    const p: merge.Policy = .{
+        .max_merged_bytes = gen.intRange(s, u64, 2_000, 200_000),
+        .segments_per_tier = gen.intRange(s, u8, 2, 12),
+        .max_merge_at_once = gen.intRange(s, u8, 2, 12),
+        .floor_bytes = gen.intRange(s, u64, 1, 2_000),
+        .deletes_pct_allowed = gen.intRange(s, u8, 5, 50),
+    };
+    var sizes: std.ArrayList(Size) = .empty;
+    defer sizes.deinit(gpa);
+    var out: std.ArrayList(usize) = .empty;
+    defer out.deinit(gpa);
+    for (0..gen.intRange(s, usize, 1, 300)) |_| {
+        if (sizes.items.len == 0 or gen.intRange(s, u8, 0, 2) != 0) {
+            // A flush: a segment of new documents.
+            const docs = gen.intRange(s, u32, 1, 40);
+            try sizes.append(gpa, .{ .bytes = @as(u64, docs) * gen.intRange(s, u64, 20, 200), .docs = docs, .deleted = 0 });
+        } else {
+            // Deletes in one segment; one with none live leaves the index.
+            const at = gen.intRange(s, usize, 0, sizes.items.len - 1);
+            const seg = &sizes.items[at];
+            seg.deleted += gen.intRange(s, u32, 1, seg.docs - seg.deleted);
+            if (seg.deleted == seg.docs) _ = sizes.orderedRemove(at);
+        }
+        // Merges until none is due.
+        var merges: usize = 0;
+        while (true) : (merges += 1) {
+            try testing.expect(merges < 10_000);
+            try out.resize(gpa, sizes.items.len);
+            const chosen = p.choose(sizes.items, out.items);
+            if (chosen.len == 0) break;
+            var live: u64 = 0;
+            for (chosen) |c| live += merge.Policy.liveBytes(sizes.items[c]);
+            if (chosen.len > 1) {
+                // No merge of several passes the cap.
+                try testing.expect(live <= p.max_merged_bytes);
+                try testing.expect(chosen.len <= @min(p.max_merge_at_once, p.segments_per_tier));
+            } else {
+                // A segment written again alone reclaims its deletes.
+                try testing.expect(sizes.items[chosen[0]].deleted > 0);
+            }
+            try sizes.append(gpa, applied(&sizes, chosen));
+        }
+        // At rest the index is within its budget: the segments the tiers
+        // allow, and the deletes allowed, of those not left alone.
+        const b = p.budget(sizes.items);
+        var counted: u64 = 0;
+        var deleted: u64 = 0;
+        for (sizes.items) |seg| {
+            const alone = merge.Policy.liveBytes(seg) > p.max_merged_bytes / 2 and @as(u64, seg.deleted) * 100 <= @as(u64, seg.docs) * p.deletes_pct_allowed;
+            if (alone) continue;
+            counted += 1;
+            deleted += seg.deleted;
+        }
+        try testing.expect(counted <= b.segments);
+        try testing.expect(deleted <= b.deleted);
+    }
+}
+
+test "the policy: no merge past the cap, and at rest the segments within the tier budget and their deletes within the allowance" {
+    try shakedown.check(testing.allocator, {}, policyHolds, .{ .seed = 0x74696572, .cases = 300 });
+}
+
+test "the policy merges the lowest scored run, skipping a segment too large to join it" {
+    const p: merge.Policy = .{ .max_merged_bytes = 1000, .segments_per_tier = 2, .max_merge_at_once = 2, .floor_bytes = 10, .deletes_pct_allowed = 20 };
     var out: [8]usize = undefined;
-    // Tier 0 (under 30 live) holds three: they merge.
-    try testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, p.choose(&.{ .{ .live = 5, .docs = 5 }, .{ .live = 100, .docs = 100 }, .{ .live = 12, .docs = 12 }, .{ .live = 40, .docs = 40 }, .{ .live = 1, .docs = 1 } }, &out));
-    // Tier 0 holds four: its three smallest merge.
-    try testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, p.choose(&.{ .{ .live = 29, .docs = 29 }, .{ .live = 2, .docs = 2 }, .{ .live = 3, .docs = 3 }, .{ .live = 4, .docs = 4 } }, &out));
-    // No tier full: the segment most deleted, past half.
-    try testing.expectEqualSlices(usize, &.{1}, p.choose(&.{ .{ .live = 5, .docs = 9 }, .{ .live = 1, .docs = 9 }, .{ .live = 100, .docs = 100 } }, &out));
-    // Nothing due.
-    try testing.expectEqualSlices(usize, &.{}, p.choose(&.{ .{ .live = 6, .docs = 9 }, .{ .live = 100, .docs = 100 } }, &out));
+    // Five of one size: more than the tiers allow; the two equal merge.
+    try testing.expectEqualSlices(usize, &.{ 0, 1 }, p.choose(&.{
+        .{ .bytes = 100, .docs = 10, .deleted = 0 },
+        .{ .bytes = 100, .docs = 10, .deleted = 0 },
+        .{ .bytes = 100, .docs = 10, .deleted = 0 },
+        .{ .bytes = 100, .docs = 10, .deleted = 0 },
+        .{ .bytes = 100, .docs = 10, .deleted = 0 },
+    }, &out));
+    // A segment past half the cap with few deletes is left alone; one with
+    // deletes past the allowance joins what fits under the cap, or with
+    // nothing that fits is written again alone.
+    try testing.expectEqualSlices(usize, &.{}, p.choose(&.{ .{ .bytes = 900, .docs = 100, .deleted = 10 }, .{ .bytes = 50, .docs = 10, .deleted = 0 } }, &out));
+    try testing.expectEqualSlices(usize, &.{ 0, 1 }, p.choose(&.{ .{ .bytes = 900, .docs = 100, .deleted = 30 }, .{ .bytes = 50, .docs = 10, .deleted = 0 } }, &out));
+    try testing.expectEqualSlices(usize, &.{0}, p.choose(&.{ .{ .bytes = 1000, .docs = 100, .deleted = 45 }, .{ .bytes = 900, .docs = 100, .deleted = 0 } }, &out));
+    // Within the budget, nothing is due.
+    try testing.expectEqualSlices(usize, &.{}, p.choose(&.{ .{ .bytes = 100, .docs = 10, .deleted = 0 }, .{ .bytes = 20, .docs = 2, .deleted = 0 } }, &out));
 }

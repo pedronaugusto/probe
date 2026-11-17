@@ -473,7 +473,7 @@ pub fn mergeStep(w: *Writer, io: Io, diagnostic: ?*merge.Diagnostic) MergeError!
     for (w.live.items, 0..) |*l, i| {
         if (!l.committed or l.changed or l.held.get().from != .file or l.deleted_count == l.docs) continue;
         try places.append(a, i);
-        try sizes.append(a, .{ .live = l.docs - l.deleted_count, .docs = l.docs });
+        try sizes.append(a, .{ .bytes = l.held.get().bytes(), .docs = l.docs, .deleted = l.deleted_count });
     }
     const chosen = w.options.merge.choose(sizes.items, try a.alloc(usize, sizes.items.len));
     if (chosen.len == 0) return null;

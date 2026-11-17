@@ -39,6 +39,8 @@ file: File,
 /// Its table: each section's place and CRC-32C, which a merge checks its
 /// reads against.
 table: files.Table,
+/// Its file's length.
+bytes: u64,
 /// Each whole section's bytes.
 whole: [whole_sections.len][]u8,
 segment: layer.read.Segment,
@@ -59,6 +61,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, e
         error.Canceled => error.Canceled,
         else => error.ReadFailed,
     };
+    o.bytes = len;
     const whole_file: source.Source = .{ .file = .{ .file = .of(file), .start = 0, .len = len } };
     var read_whole: usize = 0;
     errdefer for (o.whole[0..read_whole]) |bytes| gpa.free(bytes);

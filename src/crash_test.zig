@@ -96,7 +96,7 @@ pub const Operation = struct {
         const io = s.h.?.io();
         const dir = try makeDir(io);
         defer dir.close(io);
-        var w: Writer = try .open(s.arena.allocator(), io, dir, &schema, .{ .merge = .{ .per_tier = 2, .floor_docs = 10 } });
+        var w: Writer = try .open(s.arena.allocator(), io, dir, &schema, .{ .merge = .{ .segments_per_tier = 2, .max_merge_at_once = 2 } });
         defer w.deinit(io);
         for ([_]u64{ 1, 2, 3 }, 0..) |id, serial| try add(&w, io, id, @intCast(serial), false);
         _ = try w.commit(io);

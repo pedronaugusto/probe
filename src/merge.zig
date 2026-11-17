@@ -441,63 +441,194 @@ fn mergeStore(m: *Merge) Error!void {
     try put(m.stream, tail.items);
 }
 
-/// Which segments to merge: tiers by size, as Lucene's log merge policy
-/// keeps them. A segment's size is its live documents, at least
-/// `floor_docs`; its tier the times `per_tier` goes into its size over the
-/// floor. The lowest tier that holds `per_tier` segments merges its
-/// `per_tier` smallest; with none, the segment with the most of its
-/// documents deleted, past `deleted_percent`, is written again alone.
+/// Which segments to merge: Lucene's tiered merge policy. A segment's size
+/// is its file's bytes in proportion to its live documents; one smaller
+/// than `floor_bytes` counts as that much. The index may hold
+/// `segments_per_tier` segments of each tier, the first tier's size the
+/// smallest segment's (at least the floor), each next tier's that times the
+/// merge factor (`max_merge_at_once` or `segments_per_tier`, the smaller),
+/// up to `max_merged_bytes`. A segment past half that whose deleted share
+/// is within `deletes_pct_allowed` is left alone: it counts in no budget.
+///
+/// A merge is due when the other segments are more than the tiers allow,
+/// or their deleted documents more than `deletes_pct_allowed` of every
+/// segment's documents. Then each run of segments, largest first, is a
+/// candidate: from each segment on, the next ones are taken while their
+/// sum stays within `max_merged_bytes`, one that would pass it skipped (so
+/// the segments of a merge need not be adjacent), up to the merge factor.
+/// A candidate of one segment is a rewrite, made only to reclaim its
+/// deletes. Each candidate is scored, the lowest winning:
+///
+///     skew       its largest segment's floored size over the floored sum,
+///                or 1 / factor when a segment was skipped as too large
+///     size       the merged size to the power 0.05, so smaller merges win
+///                a tie of skew
+///     reclaim    (merged size / size before) squared, so a merge that
+///                drops deleted documents wins
+///
+///     score = skew * size * reclaim
 pub const Policy = struct {
-    per_tier: u8 = 10,
-    floor_docs: u32 = 1000,
-    deleted_percent: u8 = 33,
+    /// The largest a merge may make a segment, in live bytes.
+    max_merged_bytes: u64 = 5 * 1024 * 1024 * 1024,
+    segments_per_tier: u8 = 10,
+    max_merge_at_once: u8 = 10,
+    /// A segment smaller counts as this size.
+    floor_bytes: u64 = 2 * 1024 * 1024,
+    /// The share of documents that may be deleted, in percent, 5 to 50.
+    deletes_pct_allowed: u8 = 20,
 
-    pub const Size = struct { live: u32, docs: u32 };
+    /// A segment as the policy sees it.
+    pub const Size = struct { bytes: u64, docs: u32, deleted: u32 };
+
+    /// The budget the policy keeps `sizes` within: the segments the tiers
+    /// allow, and the deleted documents.
+    pub const Budget = struct { segments: u64, deleted: u64 };
+
+    fn check(p: Policy) void {
+        aegis.assert.invariant(p.segments_per_tier >= 2 and p.max_merge_at_once >= 2, "a merge takes two segments at least");
+        aegis.assert.invariant(p.deletes_pct_allowed >= 5 and p.deletes_pct_allowed <= 50, "deletes allowed between 5 and 50 percent");
+        aegis.assert.invariant(p.floor_bytes > 0 and p.max_merged_bytes >= p.floor_bytes, "a floor under the cap");
+    }
+
+    fn factor(p: Policy) u64 {
+        return @min(p.max_merge_at_once, p.segments_per_tier);
+    }
+
+    /// `s`'s live bytes: its bytes in proportion to its live documents.
+    pub fn liveBytes(s: Size) u64 {
+        if (s.docs == 0) return 0;
+        return @intCast(@as(u128, s.bytes) * (s.docs - s.deleted) / s.docs);
+    }
+
+    fn floored(p: Policy, bytes: u64) u64 {
+        return @max(bytes, p.floor_bytes);
+    }
+
+    /// Whether `s` is left alone: past half the cap, its deletes within the
+    /// allowance.
+    fn tooLarge(p: Policy, s: Size) bool {
+        return liveBytes(s) > p.max_merged_bytes / 2 and @as(u64, s.deleted) * 100 <= @as(u64, s.docs) * p.deletes_pct_allowed;
+    }
+
+    /// The budget for `sizes`: what `choose` keeps them within.
+    pub fn budget(p: Policy, sizes: []const Size) Budget {
+        p.check();
+        var total: u64 = 0;
+        var smallest: u64 = std.math.maxInt(u64);
+        var docs: u64 = 0;
+        for (sizes) |s| {
+            docs += s.docs;
+            if (p.tooLarge(s)) continue;
+            total += liveBytes(s);
+            smallest = @min(smallest, liveBytes(s));
+        }
+        var level = @max(smallest, p.floor_bytes);
+        var left = total;
+        var allowed: u64 = 0;
+        if (smallest != std.math.maxInt(u64)) while (true) {
+            const at_level = (left + level - 1) / level;
+            if (left / level < p.segments_per_tier or level == p.max_merged_bytes) {
+                allowed += at_level;
+                break;
+            }
+            allowed += p.segments_per_tier;
+            left -= @as(u64, p.segments_per_tier) * level;
+            level = @min(p.max_merged_bytes, level * p.factor());
+        };
+        return .{ .segments = @max(allowed, p.segments_per_tier), .deleted = docs * p.deletes_pct_allowed / 100 };
+    }
 
     /// The places in `sizes` of the segments to merge, rising, in `out`
-    /// (as long as `sizes`); none when nothing is due.
+    /// (as long as `sizes`); none when the index is within its budget.
     pub fn choose(p: Policy, sizes: []const Size, out: []usize) []usize {
-        aegis.assert.invariant(p.per_tier >= 2, "a tier merges two segments at least");
+        p.check();
         aegis.assert.invariant(out.len >= sizes.len, "room for every segment");
-        var level: u8 = 0;
-        while (level < 64) : (level += 1) {
-            var n: usize = 0;
-            for (sizes, 0..) |s, i| {
-                if (tierOf(p, s.live) == level) {
-                    out[n] = i;
-                    n += 1;
-                }
-            }
-            if (n < p.per_tier) continue;
-            // The tier's smallest, then back in their order.
-            const tier = out[0..n];
-            std.mem.sort(usize, tier, sizes, struct {
-                fn lessThan(s: []const Size, x: usize, y: usize) bool {
-                    return s[x].live < s[y].live or (s[x].live == s[y].live and x < y);
-                }
-            }.lessThan);
-            const chosen = out[0..p.per_tier];
-            std.mem.sort(usize, chosen, {}, std.sort.asc(usize));
-            return chosen;
-        }
-        var worst: ?usize = null;
+        const b = p.budget(sizes);
+        // The segments in the budget, largest first.
+        var n: usize = 0;
+        var deleted: u64 = 0;
         for (sizes, 0..) |s, i| {
-            if (s.docs == 0 or @as(u64, s.docs - s.live) * 100 < @as(u64, s.docs) * p.deleted_percent) continue;
-            if (worst == null or deletedShare(s) > deletedShare(sizes[worst.?])) worst = i;
+            if (p.tooLarge(s)) continue;
+            out[n] = i;
+            n += 1;
+            deleted += s.deleted;
         }
-        const w = worst orelse return out[0..0];
-        out[0] = w;
-        return out[0..1];
+        const eligible = out[0..n];
+        if (eligible.len <= b.segments and deleted <= b.deleted) return out[0..0];
+        std.mem.sort(usize, eligible, sizes, struct {
+            fn moreThan(s: []const Size, x: usize, y: usize) bool {
+                const a = liveBytes(s[x]);
+                const c = liveBytes(s[y]);
+                return a > c or (a == c and x < y);
+            }
+        }.moreThan);
+        var best: Candidate = .{};
+        var best_score: ?f64 = null;
+        for (0..eligible.len) |start| {
+            const c = p.candidate(sizes, eligible, start);
+            if (c.count == 0) continue;
+            // A rewrite of one segment is made only to reclaim deletes.
+            if (c.count == 1 and sizes[c.members[0]].deleted == 0) continue;
+            // Past a full merge, shorter ones from smaller segments on
+            // only score worse.
+            if (best_score != null and !c.too_large and c.count < p.factor()) break;
+            const score = p.scoreOf(sizes, &c);
+            if (best_score == null or score < best_score.?) {
+                best = c;
+                best_score = score;
+            }
+        }
+        if (best_score == null) return out[0..0];
+        const chosen = out[0..best.count];
+        @memcpy(chosen, best.members[0..best.count]);
+        std.mem.sort(usize, chosen, {}, std.sort.asc(usize));
+        return chosen;
     }
 
-    fn tierOf(p: Policy, live: u32) u8 {
-        var size: u64 = @max(live, p.floor_docs);
-        var tier: u8 = 0;
-        while (size >= @as(u64, p.floor_docs) * p.per_tier) : (tier += 1) size /= p.per_tier;
-        return tier;
+    /// A candidate: the places of the segments it takes, largest first,
+    /// their live bytes, and whether one was skipped as too large.
+    const Candidate = struct {
+        members: [std.math.maxInt(u8)]usize = undefined,
+        count: usize = 0,
+        too_large: bool = false,
+        bytes: u64 = 0,
+
+        fn take(c: *Candidate, place: usize, bytes: u64) void {
+            c.members[c.count] = place;
+            c.count += 1;
+            c.bytes += bytes;
+        }
+    };
+
+    fn candidate(p: Policy, sizes: []const Size, eligible: []const usize, start: usize) Candidate {
+        var c: Candidate = .{};
+        var at = start;
+        while (at < eligible.len and c.count < p.factor() and c.bytes < p.max_merged_bytes) : (at += 1) {
+            const bytes = liveBytes(sizes[eligible[at]]);
+            if (c.bytes + bytes > p.max_merged_bytes) {
+                c.too_large = true;
+                // A segment that cannot be merged with any is a rewrite.
+                if (c.count == 0) c.take(eligible[at], bytes);
+                continue;
+            }
+            c.take(eligible[at], bytes);
+        }
+        return c;
     }
 
-    fn deletedShare(s: Size) f64 {
-        return @as(f64, @floatFromInt(s.docs - s.live)) / @as(f64, @floatFromInt(s.docs));
+    fn scoreOf(p: Policy, sizes: []const Size, c: *const Candidate) f64 {
+        var before: u64 = 0;
+        var after_floored: u64 = 0;
+        for (c.members[0..c.count]) |place| {
+            before += sizes[place].bytes;
+            after_floored += p.floored(liveBytes(sizes[place]));
+        }
+        const skew: f64 = if (c.too_large)
+            1.0 / @as(f64, @floatFromInt(p.factor()))
+        else
+            @as(f64, @floatFromInt(p.floored(liveBytes(sizes[c.members[0]])))) / @as(f64, @floatFromInt(after_floored));
+        const size = std.math.pow(f64, @floatFromInt(@max(c.bytes, 1)), 0.05);
+        const kept = if (before == 0) 1.0 else @as(f64, @floatFromInt(c.bytes)) / @as(f64, @floatFromInt(before));
+        return skew * size * kept * kept;
     }
 };
