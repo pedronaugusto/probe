@@ -12,4 +12,5 @@ test {
     _ = @import("segment_files_test.zig");
     _ = @import("postings_test.zig");
     _ = @import("positions_test.zig");
+    _ = @import("terms_test.zig");
 }

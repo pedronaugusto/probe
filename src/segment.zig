@@ -12,3 +12,7 @@ pub const postings = @import("segment/postings.zig");
 
 /// One term's positions and offsets, a chunk per postings block.
 pub const positions = @import("segment/positions.zig");
+
+/// The term dictionary: per field an FST from term to ordinal, and each
+/// ordinal's postings and positions addresses.
+pub const terms = @import("segment/terms.zig");
