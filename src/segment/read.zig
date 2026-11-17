@@ -1,7 +1,7 @@
 //! A segment read back from its files' bodies, each already checked by
 //! `files.Expected.check`: the term dictionary, the postings and positions
 //! a term's addresses lead to, each document's length in each text field,
-//! and the ids.
+//! the ids, and each numeric field's column.
 //!
 //! What `write.zig` wrote is checked as it is read: the lengths and ids
 //! against the documents, a term's addresses against the files they point
@@ -16,6 +16,7 @@ const varint = @import("../encoding/varint.zig");
 const postings = @import("postings.zig");
 const positions = @import("positions.zig");
 const terms = @import("terms.zig");
+const columns = @import("columns.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,6 +29,7 @@ pub const Bodies = struct {
     positions: []const u8,
     lengths: []const u8,
     ids: []const u8,
+    columns: []const u8,
 };
 
 /// A term's postings, and its positions when its field keeps them.
@@ -51,6 +53,8 @@ pub const Segment = struct {
     positions: []const u8,
     /// By place; a field that is not text has none.
     lengths: []?Lengths,
+    /// By place; a field that is not numeric has none.
+    columns: []?columns.Column,
     id_column: []const u8,
     id_map: fst.Fst,
 
@@ -70,6 +74,11 @@ pub const Segment = struct {
         @memset(lengths, null);
         try readLengths(bodies.lengths, schema, docs, lengths);
 
+        const cols = try gpa.alloc(?columns.Column, schema.len);
+        errdefer gpa.free(cols);
+        @memset(cols, null);
+        try readColumns(bodies.columns, schema, docs, cols);
+
         const dictionary = try terms.Dictionary.parse(bodies.terms, @intCast(schema.len));
         return .{
             .schema = schema,
@@ -78,6 +87,7 @@ pub const Segment = struct {
             .postings = bodies.postings,
             .positions = bodies.positions,
             .lengths = lengths,
+            .columns = cols,
             .id_column = id_column,
             .id_map = id_map,
         };
@@ -85,6 +95,30 @@ pub const Segment = struct {
 
     pub fn deinit(s: *Segment, gpa: Allocator) void {
         gpa.free(s.lengths);
+        gpa.free(s.columns);
+    }
+
+    fn readColumns(body: []const u8, schema: []const Schema.Field, docs: u32, out: []?columns.Column) Error!void {
+        var at: usize = 0;
+        var numeric: u32 = 0;
+        for (schema) |f| numeric += @intFromBool(f.kind == .numeric);
+        if (try varint.read(body, &at) != numeric) return error.Corrupt;
+        var before: ?usize = null;
+        for (0..numeric) |_| {
+            const place: usize = @intCast(try varint.readAtMost(body, &at, schema.len -| 1));
+            if (schema[place].kind != .numeric) return error.Corrupt;
+            if (before) |b| if (place <= b) return error.Corrupt;
+            before = place;
+            const len: usize = @intCast(try varint.readAtMost(body, &at, body.len - at));
+            out[place] = try columns.Column.parse(body[at..][0..len], docs);
+            at += len;
+        }
+        if (at != body.len) return error.Corrupt;
+    }
+
+    /// The column of the numeric field at `place`.
+    pub fn column(s: *const Segment, place: u32) columns.Column {
+        return s.columns[place].?;
     }
 
     fn readLengths(body: []const u8, schema: []const Schema.Field, docs: u32, out: []?Lengths) Error!void {

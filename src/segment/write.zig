@@ -1,6 +1,6 @@
 //! A segment built in memory, document by document, then written as its
 //! files, each framed by `files`: the term dictionary, the postings, the
-//! positions, the lengths and the ids.
+//! positions, the lengths, the ids and the numeric columns.
 //!
 //! A document comes as its values, one per field of the schema in order,
 //! and its id. A text field's value is analyzed (`analysis/Pipeline.zig`)
@@ -18,6 +18,9 @@
 //!               endian; then an FST from each id, eight bytes big endian
 //!               so their order is the ids', to its document (the last
 //!               added, when an id is added twice)
+//!     columns   the numeric fields, a varint; per numeric field, rising by
+//!               place: its place and its column's length, varints, and
+//!               its column (`columns.zig`)
 //!
 //! The term dictionary, postings and positions are `terms.zig`'s,
 //! `postings.zig`'s and `positions.zig`'s.
@@ -32,6 +35,7 @@ const varint = @import("../encoding/varint.zig");
 const files = @import("files.zig");
 const postings = @import("postings.zig");
 const positions = @import("positions.zig");
+const columns = @import("columns.zig");
 const terms = @import("terms.zig");
 
 const Allocator = std.mem.Allocator;
@@ -56,6 +60,7 @@ pub const Files = struct {
     positions: std.ArrayList(u8) = .empty,
     lengths: std.ArrayList(u8) = .empty,
     ids: std.ArrayList(u8) = .empty,
+    columns: std.ArrayList(u8) = .empty,
 
     pub fn deinit(f: *Files, gpa: Allocator) void {
         f.terms.deinit(gpa);
@@ -63,6 +68,7 @@ pub const Files = struct {
         f.positions.deinit(gpa);
         f.lengths.deinit(gpa);
         f.ids.deinit(gpa);
+        f.columns.deinit(gpa);
     }
 
     /// The file of `kind`.
@@ -73,7 +79,8 @@ pub const Files = struct {
             .positions => f.positions.items,
             .lengths => f.lengths.items,
             .ids => f.ids.items,
-            .columns, .store, .deletions => &.{},
+            .columns => f.columns.items,
+            .store, .deletions => &.{},
         };
     }
 };
@@ -85,12 +92,14 @@ const Term = struct {
     tokens: std.ArrayList(positions.Token) = .empty,
 };
 
-/// A field's terms, and for a text field its lengths.
+/// A field's terms, for a text field its lengths, and for a numeric field
+/// its column.
 const Field = struct {
     places: std.StringHashMapUnmanaged(u32) = .empty,
     terms: std.ArrayList(Term) = .empty,
     lengths: std.ArrayList(u32) = .empty,
     total: u64 = 0,
+    column: std.ArrayList(u64) = .empty,
 };
 
 /// A segment being built.
@@ -122,6 +131,7 @@ pub const Builder = struct {
             f.terms.deinit(b.gpa);
             f.places.deinit(b.gpa);
             f.lengths.deinit(b.gpa);
+            f.column.deinit(b.gpa);
         }
         b.gpa.free(b.fields);
         b.gpa.free(b.term_buffer);
@@ -147,7 +157,10 @@ pub const Builder = struct {
                 aegis.assert.invariant(schema.kind == .keyword, "a keyword value is a keyword field's");
                 try b.note(field, bytes[0..@min(bytes.len, b.term_buffer.len)], id, null);
             },
-            .numeric => aegis.assert.invariant(schema.kind == .numeric, "a numeric value is a numeric field's"),
+            .numeric => |number| {
+                aegis.assert.invariant(schema.kind == .numeric, "a numeric value is a numeric field's");
+                try field.column.append(b.gpa, number);
+            },
         };
         try b.ids.append(b.gpa, doc.id);
         b.docs += 1;
@@ -222,6 +235,23 @@ pub const Builder = struct {
         try frame(gpa, &out.positions, .positions, segment, pos.items);
         try frame(gpa, &out.lengths, .lengths, segment, lengths.items);
         try frame(gpa, &out.ids, .ids, segment, ids.items);
+
+        var cols: std.ArrayList(u8) = .empty;
+        defer cols.deinit(gpa);
+        var column: std.ArrayList(u8) = .empty;
+        defer column.deinit(gpa);
+        var numeric: u32 = 0;
+        for (b.schema) |s| numeric += @intFromBool(s.kind == .numeric);
+        try varint.append(gpa, &cols, numeric);
+        for (b.schema, b.fields, 0..) |schema, field, place| {
+            if (schema.kind != .numeric) continue;
+            column.clearRetainingCapacity();
+            try columns.write(gpa, &column, field.column.items);
+            try varint.append(gpa, &cols, place);
+            try varint.append(gpa, &cols, column.items.len);
+            try cols.appendSlice(gpa, column.items);
+        }
+        try frame(gpa, &out.columns, .columns, segment, cols.items);
         return out;
     }
 

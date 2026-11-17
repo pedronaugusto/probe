@@ -13,5 +13,6 @@ test {
     _ = @import("postings_test.zig");
     _ = @import("positions_test.zig");
     _ = @import("terms_test.zig");
+    _ = @import("columns_test.zig");
     _ = @import("segment_test.zig");
 }

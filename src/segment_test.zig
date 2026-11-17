@@ -46,6 +46,7 @@ const Model = struct {
     fields: [max_fields]ModelField = @splat(.empty),
     lengths: [max_fields][max_docs]u32 = undefined,
     ids: [max_docs]u64 = undefined,
+    numbers: [max_fields][max_docs]u64 = undefined,
 
     fn note(m: *Model, place: usize, term: []const u8, doc: u32, token: positions.Token) !void {
         const a = m.arena.allocator();
@@ -115,7 +116,10 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
                     values[place] = .{ .keyword = word };
                     try model.note(place, word[0..@min(word.len, term_bytes)], doc, .{ .position = 0 });
                 },
-                .numeric => values[place] = .{ .numeric = gen.int(s, u64) },
+                .numeric => {
+                    model.numbers[place][doc] = if (gen.boolean(s)) gen.int(s, u64) else gen.intRange(s, u64, 0, 50);
+                    values[place] = .{ .numeric = model.numbers[place][doc] };
+                },
             }
         }
         model.ids[doc] = gen.intRange(s, u64, 0, 2 * docs);
@@ -126,7 +130,7 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     var out = try builder.finish(segment_number);
     defer out.deinit(gpa);
     var bodies: segment.read.Bodies = undefined;
-    inline for (.{ "terms", "postings", "positions", "lengths", "ids" }) |name| {
+    inline for (.{ "terms", "postings", "positions", "lengths", "ids", "columns" }) |name| {
         const kind = @field(files.Kind, name);
         const e: files.Expected = .{ .kind = kind, .segment = segment_number };
         @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
@@ -151,6 +155,10 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
                 total += model.lengths[p][d];
             }
             try testing.expectEqual(total, seg.total(place));
+        }
+        if (f.kind == .numeric) {
+            var cursor: segment.columns.Cursor = .init(seg.column(place));
+            for (0..docs) |d| try testing.expectEqual(model.numbers[p][d], try cursor.get(@intCast(d)));
         }
     }
     for (0..docs) |d| {
@@ -198,13 +206,14 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
     const gpa = testing.allocator;
     var schema_buffer: [max_fields]Schema.Field = undefined;
     const schema = schemaOf(s, &schema_buffer);
-    var buffers: [5][128]u8 = undefined;
+    var buffers: [6][128]u8 = undefined;
     const bodies: segment.read.Bodies = .{
         .terms = gen.bytesInto(s, &buffers[0]),
         .postings = gen.bytesInto(s, &buffers[1]),
         .positions = gen.bytesInto(s, &buffers[2]),
         .lengths = gen.bytesInto(s, &buffers[3]),
         .ids = gen.bytesInto(s, &buffers[4]),
+        .columns = gen.bytesInto(s, &buffers[5]),
     };
     var seg = segment.read.Segment.parse(gpa, bodies, schema) catch return;
     defer seg.deinit(gpa);
@@ -218,6 +227,10 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
         if (f.kind == .text) for (0..seg.docs) |d| {
             _ = seg.length(place, @intCast(d));
         };
+        if (f.kind == .numeric) {
+            var cursor: segment.columns.Cursor = .init(seg.column(place));
+            for (0..seg.docs) |d| _ = cursor.get(@intCast(d)) catch break;
+        }
     }
     for (0..seg.docs) |d| _ = seg.docOf(seg.idOf(@intCast(d))) catch {};
 }
