@@ -1,0 +1,8 @@
+//! Test assembly stays above the public package root.
+const std = @import("std");
+const probe = @import("probe.zig");
+
+test {
+    std.testing.refAllDecls(probe);
+    _ = @import("bitpack_test.zig");
+}
