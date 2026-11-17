@@ -79,7 +79,9 @@ suite; its properties, run by [shakedown](https://github.com/pedronaugusto/shake
 pack and unpack any block at every width and read any bytes as a block within its bounds,
 give every query the same best hits, bit for bit, as an exact reference that scores
 each document by the definition, and run queries over segments with damaged bytes, each
-answering within the segment or refusing it as corrupt.
+answering within the segment or refusing it as corrupt. In every order within two
+preemptions, a snapshot searched while the writer commits and merges answers as it did
+before the writer began.
 
 ## Licence
 
