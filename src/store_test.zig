@@ -5,7 +5,6 @@ const std = @import("std");
 const shakedown = @import("shakedown");
 const store = @import("segment.zig").store;
 const Files = @import("sources_test.zig").Files;
-const varint = @import("encoding/varint.zig");
 const warp = @import("warp");
 const Schema = @import("Schema.zig");
 
@@ -128,15 +127,14 @@ fn damaged(files: *Files, case: *shakedown.Case) anyerror!void {
     try readsWithin(st, s);
 }
 
-/// Rewrites the CRC-32C of the block count and table `body` begins with,
+/// Rewrites the CRC-32C of the table and block count `body` ends with,
 /// where they fit.
 fn fixCheck(body: []u8) void {
-    var at: usize = 0;
-    const blocks = varint.read(body, &at) catch return;
-    if (blocks > (body.len - at) / 20) return;
-    const end = at + @as(usize, @intCast(blocks)) * 20;
-    if (end + 4 > body.len) return;
-    std.mem.writeInt(u32, body[end..][0..4], warp.crc32c(0, body[0..end]), .little);
+    if (body.len < 8) return;
+    const blocks: usize = std.mem.readInt(u32, body[body.len - 8 ..][0..4], .little);
+    if (blocks > (body.len - 8) / 20) return;
+    const start = body.len - 8 - blocks * 20;
+    std.mem.writeInt(u32, body[body.len - 4 ..][0..4], warp.crc32c(0, body[start .. body.len - 4]), .little);
 }
 
 test "fuzz: a damaged store is refused, or read within its bounds" {
@@ -156,9 +154,10 @@ test "a block refused leaves the buffer within the bound" {
     defer body.deinit(gpa);
     try w.finish(&body);
     // One block: the bound is its decoded length exactly; its compressed
-    // bytes, after the varint and the table's one entry, are spoiled.
-    const raw = std.mem.readInt(u32, body.items[1 + 4 ..][0..4], .little);
-    @memset(body.items[1 + 20 + 4 ..], 0xff);
+    // bytes, before the table's one entry, are spoiled.
+    const table_start = body.items.len - 8 - 20;
+    const raw = std.mem.readInt(u32, body.items[table_start + 4 ..][0..4], .little);
+    @memset(body.items[0..table_start], 0xff);
     var st = try store.Store.parse(gpa, io, .{ .memory = body.items }, 1, &schema, raw);
     defer st.deinit(gpa);
     var buffer: std.ArrayList(u8) = .empty;
@@ -180,10 +179,9 @@ fn tableFlip(_: void, case: *shakedown.Case) anyerror!void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
     try w.finish(&body);
-    var at: usize = 0;
-    const blocks: usize = @intCast(try varint.read(body.items, &at));
-    // Any one bit of the block count, the table or its check.
-    const flip = gen.intRange(s, usize, 0, at + blocks * 20 + 4 - 1);
+    const blocks: usize = std.mem.readInt(u32, body.items[body.items.len - 8 ..][0..4], .little);
+    // Any one bit of the table, the block count or its check.
+    const flip = gen.intRange(s, usize, body.items.len - 8 - blocks * 20, body.items.len - 1);
     body.items[flip] ^= @as(u8, 1) << gen.intRange(s, u3, 0, 7);
     try testing.expectError(error.Corrupt, store.Store.parse(gpa, io, .{ .memory = body.items }, docs, &schema, max_block));
 }

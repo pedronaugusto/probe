@@ -13,7 +13,8 @@
 //!     16  segment, u64
 //!
 //! A segment file then holds its sections, each `Section` in order, one
-//! after another from the header to the table; the table, per section its
+//! after another from the header to the table, written in one pass
+//! (`Stream`); the table, per section its
 //! offset in the file and its length, u64 each, and its CRC-32C, u32; and a
 //! footer, the CRC-32C of the table, u32. A deletions file holds its body
 //! after the header, and a footer, the CRC-32C of every byte before it.
@@ -53,22 +54,22 @@ pub const Kind = enum(u8) {
     }
 };
 
-/// A segment's sections, in the order its file holds them.
+/// A segment's sections, in the order its file holds them: those written
+/// as they are produced first, then those built in memory while they are.
 pub const Section = enum(u8) {
+    /// Each term's postings, doc ids in packed blocks with skip entries,
+    /// then its positions and offsets when its field keeps them.
+    postings,
+    /// Stored fields.
+    store,
     /// Each field's term dictionary.
     terms,
-    /// Doc ids in packed blocks, with skip entries.
-    postings,
-    /// Positions and offsets.
-    positions,
     /// Each document's length per text field.
     lengths,
     /// Numeric columns.
     columns,
     /// External ids to doc ids.
     ids,
-    /// Stored fields.
-    store,
 };
 
 pub const section_count = std.enums.values(Section).len;
@@ -153,24 +154,77 @@ pub fn crc32c(crc: u32, bytes: []const u8) u32 {
     return warp.crc32c(crc, bytes);
 }
 
-/// Appends to `out` the file of `segment` holding `sections`: its header,
-/// each section in order, their table and its footer.
-pub fn appendSegment(gpa: Allocator, out: *std.ArrayList(u8), segment: u64, sections: *const Sections) Allocator.Error!void {
-    var total: usize = header_bytes + table_bytes + footer_bytes;
-    for (sections) |s| total += s.len;
-    try out.ensureUnusedCapacity(gpa, total);
-    const start = out.items.len;
-    out.appendSliceAssumeCapacity(&header(.segment, segment));
-    var table: [table_bytes]u8 = undefined;
-    for (sections, 0..) |bytes, i| {
-        const e = table[i * entry_bytes ..][0..entry_bytes];
-        std.mem.writeInt(u64, e[0..8], out.items.len - start, .little);
-        std.mem.writeInt(u64, e[8..16], bytes.len, .little);
-        std.mem.writeInt(u32, e[16..20], crc32c(0, bytes), .little);
-        out.appendSliceAssumeCapacity(bytes);
+/// A segment file written in one pass, the one way a segment is written:
+/// its header, then each section in order as its bytes come, each one's
+/// length and CRC-32C counted as it is written, then their table and its
+/// footer. The writer's errors are its own: an allocating writer's are
+/// running out of memory, a file's are the file's.
+pub const Stream = struct {
+    out: *Io.Writer,
+    /// The bytes written so far, header included.
+    written: u64 = header_bytes,
+    /// The section being written, where it starts, and its CRC-32C so far.
+    section: usize = 0,
+    start: u64 = header_bytes,
+    crc: u32 = 0,
+    entries: [section_count]Entry = undefined,
+
+    /// A stream of `segment`'s file into `out`, its header written.
+    pub fn begin(out: *Io.Writer, segment: u64) Io.Writer.Error!Stream {
+        try out.writeAll(&header(.segment, segment));
+        return .{ .out = out };
     }
-    out.appendSliceAssumeCapacity(&table);
-    out.appendSliceAssumeCapacity(&footer(crc32c(0, &table)));
+
+    /// The offset in the section being written of the next byte written.
+    pub fn at(s: *const Stream) u64 {
+        return s.written - s.start;
+    }
+
+    /// Appends `bytes` to the section being written.
+    pub fn write(s: *Stream, bytes: []const u8) Io.Writer.Error!void {
+        aegis.assert.invariant(s.section < section_count, "a section is being written");
+        try s.out.writeAll(bytes);
+        s.crc = crc32c(s.crc, bytes);
+        s.written += bytes.len;
+    }
+
+    /// Closes `section`, the one being written; the next one starts.
+    pub fn end(s: *Stream, section: Section) void {
+        aegis.assert.invariant(@backingInt(section) == s.section, "sections are written in their order");
+        s.entries[s.section] = .{ .offset = s.start, .len = s.written - s.start, .crc = s.crc };
+        s.section += 1;
+        s.start = s.written;
+        s.crc = 0;
+    }
+
+    /// Writes the table and its footer, every section closed, and flushes.
+    pub fn finish(s: *Stream) Io.Writer.Error!void {
+        aegis.assert.invariant(s.section == section_count, "every section is written");
+        var table: [table_bytes]u8 = undefined;
+        for (s.entries, 0..) |entry, i| {
+            const e = table[i * entry_bytes ..][0..entry_bytes];
+            std.mem.writeInt(u64, e[0..8], entry.offset, .little);
+            std.mem.writeInt(u64, e[8..16], entry.len, .little);
+            std.mem.writeInt(u32, e[16..20], entry.crc, .little);
+        }
+        try s.out.writeAll(&table);
+        try s.out.writeAll(&footer(crc32c(0, &table)));
+        s.written += table_bytes + footer_bytes;
+        try s.out.flush();
+    }
+};
+
+/// Appends to `out` the file of `segment` holding `sections`, written
+/// through a `Stream`.
+pub fn appendSegment(gpa: Allocator, out: *std.ArrayList(u8), segment: u64, sections: *const Sections) Allocator.Error!void {
+    var w: Io.Writer.Allocating = .fromArrayList(gpa, out);
+    defer out.* = w.toArrayList();
+    var s = Stream.begin(&w.writer, segment) catch return error.OutOfMemory;
+    for (sections, std.enums.values(Section)) |bytes, section| {
+        s.write(bytes) catch return error.OutOfMemory;
+        s.end(section);
+    }
+    s.finish() catch return error.OutOfMemory;
 }
 
 /// A deletions file's body: the bytes between its header and its footer.

@@ -288,7 +288,6 @@ fn anyBodies(files: *Files, case: *shakedown.Case) anyerror!void {
     const bodies: segment.read.Bodies = .{
         .terms = gen.bytesInto(s, &buffers[0]),
         .postings = try files.source(gen.bytesInto(s, &buffers[1]), gen.boolean(s)),
-        .positions = try files.source(gen.bytesInto(s, &buffers[2]), gen.boolean(s)),
         .lengths = gen.bytesInto(s, &buffers[3]),
         .ids = gen.bytesInto(s, &buffers[4]),
         .columns = gen.bytesInto(s, &buffers[5]),

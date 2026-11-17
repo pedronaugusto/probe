@@ -66,7 +66,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, e
         try table.checkSection(section, o.whole[i]);
         @field(bodies, @tagName(section)) = o.whole[i];
     }
-    inline for (.{ .postings, .positions, .store }) |section| {
+    inline for (.{ .postings, .store }) |section| {
         const e = table.of(section);
         @field(bodies, @tagName(section)) = .{ .file = .{ .file = .of(file), .start = e.offset, .len = e.len } };
     }

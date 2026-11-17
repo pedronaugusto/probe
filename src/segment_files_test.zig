@@ -187,17 +187,17 @@ test "a segment with a section changed opens, and is refused by its section's ch
     var f: Files = .init();
     defer f.deinit();
     const gpa = testing.allocator;
-    const sections: files.Sections = .{ "dictionary", "postings", "positions", "lengths", "columns", "ids", "store" };
+    const sections: files.Sections = .{ "postings", "store", "dictionary", "lengths", "columns", "ids" };
     var file: std.ArrayList(u8) = .empty;
     defer file.deinit(gpa);
     try files.appendSegment(gpa, &file, 5, &sections);
     // A byte of the postings section changed.
-    const postings_at = files.header_bytes + sections[0].len;
+    const postings_at = files.header_bytes;
     file.items[postings_at + 1] ^= 0xff;
     const opened = try f.fileOf(file.items);
     const e: files.Expected = .{ .kind = .segment, .segment = 5 };
     const table = try e.openSegment(io, opened);
-    try testing.expectError(error.Corrupt, table.checkSection(.postings, file.items[postings_at..][0..sections[1].len]));
+    try testing.expectError(error.Corrupt, table.checkSection(.postings, file.items[postings_at..][0..sections[0].len]));
     var buffer: [16]u8 = undefined;
     try testing.expectError(error.Corrupt, e.verify(io, opened, &buffer));
 }
@@ -223,7 +223,7 @@ test "a file's name and what it names map one to one" {
 
 test "a segment with bytes between its sections and its table is refused" {
     const gpa = testing.allocator;
-    const sections: files.Sections = .{ "dictionary", "postings", "positions", "lengths", "columns", "ids", "store" };
+    const sections: files.Sections = .{ "postings", "store", "dictionary", "lengths", "columns", "ids" };
     var file: std.ArrayList(u8) = .empty;
     defer file.deinit(gpa);
     try files.appendSegment(gpa, &file, 5, &sections);

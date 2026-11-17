@@ -1,26 +1,27 @@
 //! A segment's stored fields: for each document, the values of the fields
 //! the schema stores, in blocks of about 16 KiB each compressed with LZ4
-//! (warp), so a document is read by decompressing one block. The table is
-//! held in memory; a block is read from the `Source` when a document of it
-//! is asked for.
+//! (warp), so a document is read by decompressing one block. The blocks
+//! are written as they close, then their table; the table is held in
+//! memory, and a block is read from the `Source` when a document of it is
+//! asked for.
 //!
 //! A document's values, in the order of the stored fields: a text or
 //! keyword value as its length and its bytes, a numeric value as itself,
-//! each a varint. The body of the store file:
+//! each a varint. The store's section:
 //!
-//!     blocks       a varint
+//!     data         the blocks, each an LZ4 block
 //!     table        per block: its first document and its length decoded,
 //!                  u32 each, then where it starts in the data, u64, and
 //!                  its length there, u32, little endian
-//!     check        the CRC-32C of the blocks and the table, u32 little
+//!     blocks       their count, u32 little endian
+//!     check        the CRC-32C of the table and the count, u32 little
 //!                  endian, so the table is checked whole when it is read
-//!     data         the blocks, each an LZ4 block
 //!
 //! What is read is checked: the table (its CRC-32C, first documents
-//! rising from zero, the blocks contiguous in the data, each no longer
-//! decoded than the caller's bound nor longer compressed than its decoding
-//! allows), a block's decoded length, and each value inside it. Bytes that
-//! break a rule are `error.Corrupt`.
+//! rising from zero, the blocks contiguous in the data and filling it, each
+//! no longer decoded than the caller's bound nor longer compressed than its
+//! decoding allows), a block's decoded length, and each value inside it.
+//! Bytes that break a rule are `error.Corrupt`.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
@@ -33,7 +34,6 @@ const source_mod = @import("source.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Source = source_mod.Source;
-const Window = source_mod.Window;
 
 pub const Error = source_mod.Error;
 
@@ -57,7 +57,9 @@ pub const Writer = struct {
     first: u32 = 0,
     docs: u32 = 0,
     table: std.ArrayList(u8) = .empty,
+    /// The blocks closed and not yet taken, and the data's bytes before them.
     data: std.ArrayList(u8) = .empty,
+    taken_bytes: u64 = 0,
     blocks: u32 = 0,
 
     pub fn init(gpa: Allocator) Allocator.Error!Writer {
@@ -88,7 +90,7 @@ pub const Writer = struct {
     fn close(w: *Writer) Allocator.Error!void {
         if (w.docs == w.first) return;
         aegis.assert.invariant(w.raw.items.len <= std.math.maxInt(u32), "a block decodes to less than 4 GiB");
-        const start = w.data.items.len;
+        const start = w.taken_bytes + w.data.items.len;
         try w.data.ensureUnusedCapacity(w.gpa, warp.lz4.blockBound(w.raw.items.len));
         const len = w.compressor.compressBlock(w.raw.items, w.data.unusedCapacitySlice(), .{}) catch aegis.assert.never("an output of blockBound bytes always holds the block");
         w.data.items.len += len;
@@ -103,18 +105,36 @@ pub const Writer = struct {
         w.raw.clearRetainingCapacity();
     }
 
-    /// Appends the store's body to `out`.
+    /// The blocks closed since the last `take`, in order, to write out
+    /// before the next ones.
+    pub fn ready(w: *const Writer) []const u8 {
+        return w.data.items;
+    }
+
+    /// Lets the blocks `ready` gave go, written.
+    pub fn take(w: *Writer) void {
+        w.taken_bytes += w.data.items.len;
+        w.data.clearRetainingCapacity();
+    }
+
+    /// Appends to `out` what is left of the store's section after the
+    /// blocks `take` let go: the last blocks, the table, its count and its
+    /// check.
     pub fn finish(w: *Writer, out: *std.ArrayList(u8)) Allocator.Error!void {
         try w.close();
-        const start = out.items.len;
-        try varint.append(w.gpa, out, w.blocks);
-        try out.appendSlice(w.gpa, w.table.items);
-        var check: [4]u8 = undefined;
-        std.mem.writeInt(u32, &check, warp.crc32c(0, out.items[start..]), .little);
-        try out.appendSlice(w.gpa, &check);
         try out.appendSlice(w.gpa, w.data.items);
+        const start = out.items.len;
+        try out.appendSlice(w.gpa, w.table.items);
+        var tail: [8]u8 = undefined;
+        std.mem.writeInt(u32, tail[0..4], w.blocks, .little);
+        try out.appendSlice(w.gpa, tail[0..4]);
+        std.mem.writeInt(u32, tail[4..8], warp.crc32c(0, out.items[start..]), .little);
+        try out.appendSlice(w.gpa, tail[4..8]);
     }
 };
+
+/// The bytes after the table: the count of blocks and the check.
+const trailer_bytes = 8;
 
 /// One block's place in the table.
 const Entry = struct {
@@ -130,28 +150,31 @@ pub const Store = struct {
     docs: u32,
     fields: []const Schema.Field,
     blocks: u32,
+    /// The table, its count and its check, as read: the section's last
+    /// bytes.
     table: []const u8,
     source: Source,
-    /// Where the blocks start in the body.
-    data_start: u64,
+    /// The blocks' bytes, from the section's start.
+    data_len: u64,
 
-    /// The store in `source`, a store body, for `docs` documents of
+    /// The store in `source`, a store's section, for `docs` documents of
     /// `schema`, each block decoding to at most `max_block` bytes: its
     /// table read on `io` into memory from `gpa`, and checked whole.
     pub fn parse(gpa: Allocator, io: Io, source: Source, docs: u32, schema: []const Schema.Field, max_block: u32) (Error || Allocator.Error)!Store {
-        var window: Window = .init(source, io);
-        var head_buffer: [varint.max_bytes]u8 = undefined;
-        const head = try window.upTo(&head_buffer, 0, head_buffer.len, source.len());
-        var at: usize = 0;
-        const blocks: u32 = @intCast(try varint.readAtMost(head, &at, docs));
+        const len = source.len();
+        if (len < trailer_bytes) return error.Corrupt;
+        var tail: [trailer_bytes]u8 = undefined;
+        try source.read(io, len - trailer_bytes, &tail);
+        const blocks = std.mem.readInt(u32, tail[0..4], .little);
+        if (blocks > docs) return error.Corrupt;
         const table_len = @as(u64, blocks) * entry_bytes;
-        const held = try source.alloc(io, gpa, at, table_len + 4);
+        if (table_len > len - trailer_bytes) return error.Corrupt;
+        const data_len = len - trailer_bytes - table_len;
+        const held = try source.alloc(io, gpa, data_len, table_len + trailer_bytes);
         errdefer gpa.free(held);
-        const table = held[0..@intCast(table_len)];
-        const crc = warp.crc32c(warp.crc32c(0, head[0..at]), table);
-        if (std.mem.readInt(u32, held[@intCast(table_len)..][0..4], .little) != crc) return error.Corrupt;
-        const s: Store = .{ .docs = docs, .fields = schema, .blocks = blocks, .table = held, .source = source, .data_start = at + table_len + 4 };
-        const data_len = source.len() - s.data_start;
+        const checked = held[0..@intCast(table_len + 4)];
+        if (std.mem.readInt(u32, held[checked.len..][0..4], .little) != warp.crc32c(0, checked)) return error.Corrupt;
+        const s: Store = .{ .docs = docs, .fields = schema, .blocks = blocks, .table = held, .source = source, .data_len = data_len };
         var expected: u64 = 0;
         var before: ?u32 = null;
         for (0..blocks) |b| {
@@ -205,7 +228,7 @@ pub const Store = struct {
         // A refused block leaves the buffer empty.
         errdefer buffer.clearRetainingCapacity();
         const compressed = buffer.items[e.raw..];
-        try s.source.read(io, s.data_start + e.start, compressed);
+        try s.source.read(io, e.start, compressed);
         const decoded = warp.lz4.decompressBlock(compressed, buffer.items[0..e.raw], .{}) catch return error.Corrupt;
         if (decoded.out_len != e.raw) return error.Corrupt;
         buffer.shrinkRetainingCapacity(e.raw);

@@ -6,7 +6,9 @@
 //! meanwhile.
 //!
 //! `aegis.Shared` cleans up without an `Io`, so a held segment keeps the
-//! `Io` it was opened on, to close its file with.
+//! `Io` it was opened on, to close its file with. The move to aegis 0.3.0
+//! takes `aegis.SharedIo`, whose last `release(io)` closes it through the
+//! releaser's `Io`, and drops the `io` field in the same commit.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");

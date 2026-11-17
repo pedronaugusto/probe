@@ -1,7 +1,7 @@
 //! A segment built in memory, document by document, then written as its
-//! file (`files.appendSegment`), one section each for the term dictionary,
-//! the postings, the positions, the lengths, the numeric columns, the ids
-//! and the stored fields.
+//! file through `files.Stream`: each term's postings and positions, the
+//! stored fields, the term dictionary, the lengths, the numeric columns and
+//! the ids. The sections' writers are shared with the merge.
 //!
 //! A document comes as its values, one per field of the schema in order,
 //! and its id. A text field's value is analyzed (`analysis/Pipeline.zig`)
@@ -187,165 +187,216 @@ pub const Builder = struct {
 
     /// The segment's file, as segment `segment`: its bytes, the caller's.
     pub fn finish(b: *Builder, segment: u64) Allocator.Error!std.ArrayList(u8) {
+        var out: std.Io.Writer.Allocating = .init(b.gpa);
+        errdefer out.deinit();
+        // An allocating writer fails only for memory.
+        b.write(&out.writer, segment) catch return error.OutOfMemory;
+        return out.toArrayList();
+    }
+
+    /// The segment's file, as segment `segment`, streamed into `out`.
+    pub fn write(b: *Builder, out: *std.Io.Writer, segment: u64) WriteError!void {
         const gpa = b.gpa;
+        var stream = try files.Stream.begin(out, segment);
         var dictionary: std.ArrayList(u8) = .empty;
         defer dictionary.deinit(gpa);
-        var post: std.ArrayList(u8) = .empty;
-        defer post.deinit(gpa);
-        var pos: std.ArrayList(u8) = .empty;
-        defer pos.deinit(gpa);
-
+        var entry: std.ArrayList(u8) = .empty;
+        defer entry.deinit(gpa);
         var indexed: u32 = 0;
         for (b.fields) |f| indexed += @intFromBool(f.terms.items.len > 0);
         try terms.begin(gpa, &dictionary, indexed);
         for (b.schema, b.fields, 0..) |schema, *field, place| {
             if (field.terms.items.len == 0) continue;
-            try b.writeField(schema, field, @intCast(place), &dictionary, &post, &pos);
+            try b.writeField(schema, field, @intCast(place), &stream, &entry, &dictionary);
         }
+        stream.end(.postings);
 
-        var lengths: std.ArrayList(u8) = .empty;
-        defer lengths.deinit(gpa);
-        var text: u32 = 0;
-        for (b.schema) |s| text += @intFromBool(s.kind == .text);
-        try varint.append(gpa, &lengths, text);
-        for (b.schema, b.fields, 0..) |schema, field, place| {
-            if (schema.kind != .text) continue;
-            try varint.append(gpa, &lengths, place);
-            try appendInt(gpa, &lengths, u64, field.total);
-            for (field.lengths.items) |l| try appendInt(gpa, &lengths, u32, l);
+        try stream.write(b.store.ready());
+        b.store.take();
+        entry.clearRetainingCapacity();
+        try b.store.finish(&entry);
+        try stream.write(entry.items);
+        stream.end(.store);
+
+        try stream.write(dictionary.items);
+        stream.end(.terms);
+
+        const lengths = try gpa.alloc([]const u32, b.schema.len);
+        defer gpa.free(lengths);
+        const totals = try gpa.alloc(u64, b.schema.len);
+        defer gpa.free(totals);
+        const cols = try gpa.alloc([]const u64, b.schema.len);
+        defer gpa.free(cols);
+        for (b.fields, lengths, totals, cols) |f, *l, *t, *c| {
+            l.* = f.lengths.items;
+            t.* = f.total;
+            c.* = f.column.items;
         }
-
-        var ids: std.ArrayList(u8) = .empty;
-        defer ids.deinit(gpa);
-        try b.writeIds(&ids);
-
-        var cols: std.ArrayList(u8) = .empty;
-        defer cols.deinit(gpa);
-        var column: std.ArrayList(u8) = .empty;
-        defer column.deinit(gpa);
-        var numeric: u32 = 0;
-        for (b.schema) |s| numeric += @intFromBool(s.kind == .numeric);
-        try varint.append(gpa, &cols, numeric);
-        for (b.schema, b.fields, 0..) |schema, field, place| {
-            if (schema.kind != .numeric) continue;
-            column.clearRetainingCapacity();
-            try columns.write(gpa, &column, field.column.items);
-            try varint.append(gpa, &cols, place);
-            try varint.append(gpa, &cols, column.items.len);
-            try cols.appendSlice(gpa, column.items);
-        }
-
-        var stored: std.ArrayList(u8) = .empty;
-        defer stored.deinit(gpa);
-        try b.store.finish(&stored);
-
-        var sections: files.Sections = undefined;
-        sections[@backingInt(files.Section.terms)] = dictionary.items;
-        sections[@backingInt(files.Section.postings)] = post.items;
-        sections[@backingInt(files.Section.positions)] = pos.items;
-        sections[@backingInt(files.Section.lengths)] = lengths.items;
-        sections[@backingInt(files.Section.columns)] = cols.items;
-        sections[@backingInt(files.Section.ids)] = ids.items;
-        sections[@backingInt(files.Section.store)] = stored.items;
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        try files.appendSegment(gpa, &out, segment, &sections);
-        return out;
+        entry.clearRetainingCapacity();
+        try appendLengths(gpa, &entry, b.schema, lengths, totals);
+        try stream.write(entry.items);
+        stream.end(.lengths);
+        entry.clearRetainingCapacity();
+        try appendColumns(gpa, &entry, b.schema, cols);
+        try stream.write(entry.items);
+        stream.end(.columns);
+        entry.clearRetainingCapacity();
+        try appendIds(gpa, &entry, b.ids.items);
+        try stream.write(entry.items);
+        stream.end(.ids);
+        try stream.finish();
     }
 
-    fn writeField(b: *Builder, schema: Schema.Field, field: *Field, place: u32, dictionary: *std.ArrayList(u8), post: *std.ArrayList(u8), pos: *std.ArrayList(u8)) Allocator.Error!void {
+    fn writeField(b: *Builder, schema: Schema.Field, field: *Field, place: u32, stream: *files.Stream, entry: *std.ArrayList(u8), dictionary: *std.ArrayList(u8)) WriteError!void {
         const gpa = b.gpa;
         // The terms in byte order.
-        const order = try gpa.alloc(Entry, field.terms.items.len);
+        const order = try gpa.alloc(Order, field.terms.items.len);
         defer gpa.free(order);
         var it = field.places.iterator();
         var n: usize = 0;
         while (it.next()) |e| : (n += 1) order[n] = .{ .term = e.key_ptr.*, .index = e.value_ptr.* };
-        std.mem.sort(Entry, order, {}, Entry.lessThan);
+        std.mem.sort(Order, order, {}, Order.lessThan);
         var writer: terms.FieldWriter = .init(gpa);
         defer writer.deinit();
         var slices: std.ArrayList([]const positions.Token) = .empty;
         defer slices.deinit(gpa);
-        for (order) |entry| {
-            const t = &field.terms.items[entry.index];
-            var address: terms.Address = .{ .postings = post.items.len };
-            try postings.write(gpa, post, t.postings.items, if (schema.kind == .text) field.lengths.items else null);
+        for (order) |o| {
+            const t = &field.terms.items[o.index];
+            slices.clearRetainingCapacity();
             if (schema.positions) {
-                address.positions = pos.items.len;
-                slices.clearRetainingCapacity();
                 var at: usize = 0;
                 for (t.postings.items) |p| {
                     try slices.append(gpa, t.tokens.items[at..][0..p.freq]);
                     at += p.freq;
                 }
-                try positions.write(gpa, pos, slices.items, schema.offsets);
             }
-            writer.add(entry.term, address) catch |err| return rising(err);
+            entry.clearRetainingCapacity();
+            const address = try appendEntry(gpa, entry, stream.at(), schema, t.postings.items, if (schema.kind == .text) field.lengths.items else null, slices.items);
+            try stream.write(entry.items);
+            writer.add(o.term, address) catch |err| return rising(err);
         }
         try writer.finish(place, dictionary);
     }
 
-    const Entry = struct {
+    const Order = struct {
         term: []const u8,
         index: u32,
 
-        fn lessThan(_: void, a: Entry, c: Entry) bool {
+        fn lessThan(_: void, a: Order, c: Order) bool {
             return std.mem.order(u8, a.term, c.term) == .lt;
         }
     };
-
-    fn writeIds(b: *Builder, out: *std.ArrayList(u8)) Allocator.Error!void {
-        const gpa = b.gpa;
-        try varint.append(gpa, out, b.docs);
-        for (b.ids.items) |id| try appendInt(gpa, out, u64, id);
-        // Sorted by id, then by doc: each run is an id's documents.
-        const pairs = try gpa.alloc([2]u64, b.ids.items.len);
-        defer gpa.free(pairs);
-        for (pairs, b.ids.items, 0..) |*p, id, doc| p.* = .{ id, doc };
-        std.mem.sort([2]u64, pairs, {}, struct {
-            fn lessThan(_: void, x: [2]u64, y: [2]u64) bool {
-                return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1]);
-            }
-        }.lessThan);
-        // Each document added after another with its id, and that one, by doc.
-        var earlier: std.ArrayList([2]u32) = .empty;
-        defer earlier.deinit(gpa);
-        var later: usize = 1;
-        while (later < pairs.len) : (later += 1) {
-            const one = pairs[later - 1];
-            const two = pairs[later];
-            if (one[0] == two[0]) try earlier.append(gpa, .{ @intCast(two[1]), @intCast(one[1]) });
-        }
-        std.mem.sort([2]u32, earlier.items, {}, struct {
-            fn lessThan(_: void, x: [2]u32, y: [2]u32) bool {
-                return x[0] < y[0];
-            }
-        }.lessThan);
-        try varint.append(gpa, out, earlier.items.len);
-        for (earlier.items) |e| {
-            try appendInt(gpa, out, u32, e[0]);
-            try appendInt(gpa, out, u32, e[1]);
-        }
-        // Each id to its last document: the last of each run.
-        var map: fst.Builder = .init(gpa);
-        defer map.deinit();
-        for (pairs, 0..) |p, i| {
-            if (i + 1 < pairs.len and pairs[i + 1][0] == p[0]) continue;
-            var key: [8]u8 = undefined;
-            std.mem.writeInt(u64, &key, p[0], .big);
-            map.add(&key, p[1]) catch |err| return rising(err);
-        }
-        // `finish` writes into a list of its own, which it clears first.
-        var keys: std.ArrayList(u8) = .empty;
-        defer keys.deinit(gpa);
-        try map.finish(&keys);
-        try out.appendSlice(gpa, keys.items);
-    }
 };
+
+pub const WriteError = std.Io.Writer.Error || Allocator.Error;
+
+/// Appends to `entry` a term's entry in the postings section, which starts
+/// there at `at`: its postings (`postings_list`, with each document's
+/// length in a text field for its impacts), then its positions when its
+/// field keeps them (`tokens`, a document's per posting). Its address.
+pub fn appendEntry(
+    gpa: Allocator,
+    entry: *std.ArrayList(u8),
+    at: u64,
+    schema: Schema.Field,
+    postings_list: []const postings.Posting,
+    lengths: ?[]const u32,
+    tokens: []const []const positions.Token,
+) Allocator.Error!terms.Address {
+    const start = entry.items.len;
+    var address: terms.Address = .{ .postings = at };
+    try postings.write(gpa, entry, postings_list, lengths);
+    if (schema.positions) {
+        aegis.assert.invariant(tokens.len == postings_list.len, "a posting's tokens each");
+        address.positions = at + (entry.items.len - start);
+        try positions.write(gpa, entry, tokens, schema.offsets);
+    }
+    return address;
+}
+
+/// Appends the lengths section: per text field of `schema`, `totals` and
+/// each document's of `lengths`, by place.
+pub fn appendLengths(gpa: Allocator, out: *std.ArrayList(u8), schema: []const Schema.Field, lengths: []const []const u32, totals: []const u64) Allocator.Error!void {
+    var text: u32 = 0;
+    for (schema) |s| text += @intFromBool(s.kind == .text);
+    try varint.append(gpa, out, text);
+    for (schema, lengths, totals, 0..) |s, each, total, place| {
+        if (s.kind != .text) continue;
+        try varint.append(gpa, out, place);
+        try appendInt(gpa, out, u64, total);
+        for (each) |l| try appendInt(gpa, out, u32, l);
+    }
+}
+
+/// Appends the columns section: per numeric field of `schema`, its
+/// column of `values`, by place.
+pub fn appendColumns(gpa: Allocator, out: *std.ArrayList(u8), schema: []const Schema.Field, values: []const []const u64) Allocator.Error!void {
+    var column: std.ArrayList(u8) = .empty;
+    defer column.deinit(gpa);
+    var numeric: u32 = 0;
+    for (schema) |s| numeric += @intFromBool(s.kind == .numeric);
+    try varint.append(gpa, out, numeric);
+    for (schema, values, 0..) |s, each, place| {
+        if (s.kind != .numeric) continue;
+        column.clearRetainingCapacity();
+        try columns.write(gpa, &column, each);
+        try varint.append(gpa, out, place);
+        try varint.append(gpa, out, column.items.len);
+        try out.appendSlice(gpa, column.items);
+    }
+}
+
+/// Appends the ids section of documents whose ids are `ids`, by doc.
+pub fn appendIds(gpa: Allocator, out: *std.ArrayList(u8), ids: []const u64) Allocator.Error!void {
+    try varint.append(gpa, out, ids.len);
+    for (ids) |id| try appendInt(gpa, out, u64, id);
+    // Sorted by id, then by doc: each run is an id's documents.
+    const pairs = try gpa.alloc([2]u64, ids.len);
+    defer gpa.free(pairs);
+    for (pairs, ids, 0..) |*p, id, doc| p.* = .{ id, doc };
+    std.mem.sort([2]u64, pairs, {}, struct {
+        fn lessThan(_: void, x: [2]u64, y: [2]u64) bool {
+            return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1]);
+        }
+    }.lessThan);
+    // Each document added after another with its id, and that one, by doc.
+    var earlier: std.ArrayList([2]u32) = .empty;
+    defer earlier.deinit(gpa);
+    var later: usize = 1;
+    while (later < pairs.len) : (later += 1) {
+        const one = pairs[later - 1];
+        const two = pairs[later];
+        if (one[0] == two[0]) try earlier.append(gpa, .{ @intCast(two[1]), @intCast(one[1]) });
+    }
+    std.mem.sort([2]u32, earlier.items, {}, struct {
+        fn lessThan(_: void, x: [2]u32, y: [2]u32) bool {
+            return x[0] < y[0];
+        }
+    }.lessThan);
+    try varint.append(gpa, out, earlier.items.len);
+    for (earlier.items) |e| {
+        try appendInt(gpa, out, u32, e[0]);
+        try appendInt(gpa, out, u32, e[1]);
+    }
+    // Each id to its last document: the last of each run.
+    var map: fst.Builder = .init(gpa);
+    defer map.deinit();
+    for (pairs, 0..) |p, i| {
+        if (i + 1 < pairs.len and pairs[i + 1][0] == p[0]) continue;
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, p[0], .big);
+        map.add(&key, p[1]) catch |err| return rising(err);
+    }
+    // `finish` writes into a list of its own, which it clears first.
+    var keys: std.ArrayList(u8) = .empty;
+    defer keys.deinit(gpa);
+    try map.finish(&keys);
+    try out.appendSlice(gpa, keys.items);
+}
 
 /// An FST add's error where the keys are distinct and sorted by
 /// construction: only running out of memory.
-fn rising(err: fst.Builder.AddError) Allocator.Error {
+pub fn rising(err: fst.Builder.AddError) Allocator.Error {
     return switch (err) {
         error.NotRising => aegis.assert.never("a field's terms and a segment's ids are added distinct and sorted"),
         error.OutOfMemory => error.OutOfMemory,

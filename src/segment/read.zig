@@ -1,7 +1,8 @@
 //! A segment read back from its file's sections: the term dictionary, the
 //! lengths, the ids and the columns held in memory, each already checked
-//! by its CRC-32C; the postings, positions and stored blocks read from the
-//! file as they are asked for (`source.zig`). It gives the
+//! by its CRC-32C; the postings, each term's positions after its postings,
+//! and the stored blocks read from the file as they are asked for
+//! (`source.zig`). It gives the
 //! postings and positions a term's addresses lead to, each document's
 //! length in each text field, the ids, each numeric field's column, and
 //! each document's stored values.
@@ -37,8 +38,8 @@ pub const Bodies = struct {
     lengths: []const u8,
     ids: []const u8,
     columns: []const u8,
+    /// Each term's postings, then its positions when its field keeps them.
     postings: Source,
-    positions: Source,
     store: Source,
 };
 
@@ -55,7 +56,6 @@ pub fn inMemory(sections: files.Sections) Bodies {
         .ids = of(sections, .ids),
         .columns = of(sections, .columns),
         .postings = .{ .memory = of(sections, .postings) },
-        .positions = .{ .memory = of(sections, .positions) },
         .store = .{ .memory = of(sections, .store) },
     };
 }
@@ -77,8 +77,8 @@ pub const Segment = struct {
     schema: []const Schema.Field,
     docs: u32,
     dictionary: terms.Dictionary,
+    /// Each term's postings, then its positions when its field keeps them.
     postings: Source,
-    positions: Source,
     /// By place; a field that is not text has none.
     lengths: []?Lengths,
     /// By place; a field that is not numeric has none.
@@ -127,7 +127,6 @@ pub const Segment = struct {
             .docs = docs,
             .dictionary = dictionary,
             .postings = bodies.postings,
-            .positions = bodies.positions,
             .lengths = lengths,
             .columns = cols,
             .stored = stored,
@@ -214,7 +213,7 @@ pub const Segment = struct {
         const keeps = s.schema[place].positions;
         if (keeps != (address.positions != terms.no_positions)) return error.Corrupt;
         if (!keeps) return .{ .postings = p, .positions = null };
-        return .{ .postings = p, .positions = try positions.Reader.init(s.positions, io, address.positions, p.docFreq(), s.schema[place].offsets) };
+        return .{ .postings = p, .positions = try positions.Reader.init(s.postings, io, address.positions, p.docFreq(), s.schema[place].offsets) };
     }
 
     /// `doc`'s length in the text field at `place`.
