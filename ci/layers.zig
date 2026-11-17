@@ -3,6 +3,8 @@ const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "vocabulary", .patterns = &.{ "src/ids.zig", "src/Limits.zig", "src/Schema.zig" } },
+    .{ .name = "analysis", .patterns = &.{ "src/analysis/words.zig", "src/analysis/identifier.zig", "src/analysis/Pipeline.zig" } },
+    .{ .name = "analysis entry", .patterns = &.{"src/analysis.zig"} },
     .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig", "src/encoding/bitmap.zig" } },
     .{ .name = "encoding entry", .patterns = &.{"src/encoding.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
@@ -16,7 +18,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
     .{
         .name = "named dependencies",
         .unresolved_only = true,
-        .except_targets = &.{ "std", "aegis", "shakedown", "builtin" },
+        .except_targets = &.{ "std", "aegis", "xenoglyph", "shakedown", "builtin" },
     },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
 };
@@ -29,6 +31,10 @@ pub const required = [_][]const u8{
     "src/ids.zig",
     "src/Limits.zig",
     "src/Schema.zig",
+    "src/analysis/words.zig",
+    "src/analysis/identifier.zig",
+    "src/analysis/Pipeline.zig",
+    "src/analysis.zig",
     "src/encoding/bitpack.zig",
     "src/encoding/fst.zig",
     "src/encoding/bitmap.zig",

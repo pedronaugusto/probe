@@ -8,9 +8,10 @@ last commit readable.
 
 ## Status
 
-In development, and not yet released. What is built so far is the encoding layer: doc ids
-as gaps, packed in blocks of 128 integers to the fewest bits that hold the block, in the
-SIMD-BP128 layout, the same bytes on every target.
+In development, and not yet released. What is built so far: the schema a document type
+declares; the encoding layer (doc ids as gaps packed in blocks of 128 in the SIMD-BP128
+layout, the same bytes on every target; the term dictionary as a minimal finite state
+transducer; deletion bitmaps); and the analysis of text into terms.
 
 ## Testing
 

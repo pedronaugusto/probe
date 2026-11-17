@@ -2,8 +2,8 @@
 //! BM25 ranking, built in layers; this is the package's root, and it names
 //! what is public.
 //!
-//! In development: the vocabulary and the encoding layer are here, the
-//! index above them is not.
+//! In development: the vocabulary, the analysis and the encoding layer are
+//! here, the index above them is not.
 const encoding = @import("encoding.zig");
 const ids = @import("ids.zig");
 

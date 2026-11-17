@@ -8,4 +8,5 @@ test {
     _ = @import("fst_test.zig");
     _ = @import("bitmap_test.zig");
     _ = @import("schema_test.zig");
+    _ = @import("analysis_test.zig");
 }
