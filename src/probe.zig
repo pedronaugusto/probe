@@ -2,8 +2,23 @@
 //! BM25 ranking, built in layers; this is the package's root, and it names
 //! what is public.
 //!
-//! In development: the encoding layer is here, the index above it is not.
+//! In development: the vocabulary and the encoding layer are here, the
+//! index above them is not.
 const encoding = @import("encoding.zig");
+const ids = @import("ids.zig");
+
+/// A document's place in its segment.
+pub const DocId = ids.DocId;
+
+/// The id the program gives each document of type `Doc`.
+pub const Id = ids.Id;
+
+/// The bounds on documents, terms and queries.
+pub const Limits = @import("Limits.zig");
+
+/// A document type's fields as probe indexes them, from its `pub const
+/// probe` declaration.
+pub const Schema = @import("Schema.zig");
 
 /// Integers in blocks of 128 packed to the fewest bits (SIMD-BP128's
 /// layout), and doc ids as gaps.

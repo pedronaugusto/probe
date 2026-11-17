@@ -7,4 +7,5 @@ test {
     _ = @import("bitpack_test.zig");
     _ = @import("fst_test.zig");
     _ = @import("bitmap_test.zig");
+    _ = @import("schema_test.zig");
 }
