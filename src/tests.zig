@@ -16,4 +16,5 @@ test {
     _ = @import("columns_test.zig");
     _ = @import("store_test.zig");
     _ = @import("segment_test.zig");
+    _ = @import("manifest_test.zig");
 }

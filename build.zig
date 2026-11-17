@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// What a project that depends on probe builds: the `probe` module, on
-/// aegis, xenoglyph and warp. The tests, checks and gate are `dev`'s.
+/// aegis, xenoglyph, warp, strand and airlock. The tests, checks and gate are `dev`'s.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -9,11 +9,11 @@ pub fn build(b: *std.Build) void {
     addSourceImports(b, module, target, optimize);
 }
 
-/// What probe's sources import: aegis, xenoglyph and warp.
+/// What probe's sources import: aegis, xenoglyph, warp, strand and airlock.
 fn addSourceImports(p: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
-    module.addImport("aegis", p.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
-    module.addImport("xenoglyph", p.dependency("xenoglyph", .{ .target = target, .optimize = optimize }).module("xenoglyph"));
-    module.addImport("warp", p.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp"));
+    inline for (.{ "aegis", "xenoglyph", "warp", "strand", "airlock" }) |name| {
+        module.addImport(name, p.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
+    }
 }
 
 /// probe's development: its tests and checks under preflight's gate. Run through bay.
@@ -45,11 +45,11 @@ pub fn dev(b: *std.Build, tools: type) void {
         .portable_tests = true,
         .hardened = .{ .fuzz_step = "test", .tsan_step = "test" },
     });
-    // A project that depends on probe by path, with aegis, xenoglyph and
-    // warp and nothing else to fetch: the build a consumer gets.
+    // A project that depends on probe by path, with its dependencies and
+    // nothing else to fetch: the build a consumer gets.
     tools.preflight.addConsumerCheck(b, p, .{
         .package = "probe",
         .program = p.path("ci/consumer.zig"),
-        .packages = &.{ p.dependency("aegis", .{}), p.dependency("xenoglyph", .{}), p.dependency("warp", .{}) },
+        .packages = &.{ p.dependency("aegis", .{}), p.dependency("xenoglyph", .{}), p.dependency("warp", .{}), p.dependency("strand", .{}), p.dependency("airlock", .{}) },
     });
 }
