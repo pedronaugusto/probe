@@ -266,12 +266,44 @@ pub const Reader = struct {
     /// or null when none is. A block whose last doc is below `target` is
     /// passed by its skip entry, never read.
     pub fn advance(r: *Reader, target: u32) Error!?Posting {
-        while (r.entered == 0 or r.last < target) {
+        while (r.entered == 0 or r.last < target or (r.decoded and r.index == r.count)) {
             if (!try r.nextBlock()) return null;
         }
         if (!r.decoded) try r.decode();
-        while (try r.next()) |p| if (p.doc >= target) return p;
-        return null;
+        // The block's last doc is at or past `target`: gallop from where
+        // the reader stands to a stretch holding the first such doc, then
+        // halve it. Every doc before `lo` is below `target`.
+        var lo: usize = r.index;
+        var step: usize = 1;
+        while (lo + step - 1 < r.count and r.doc_buffer[lo + step - 1] < target) {
+            lo += step;
+            step *= 2;
+        }
+        var hi: usize = @min(lo + step - 1, @as(usize, r.count) - 1);
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (r.doc_buffer[mid] < target) lo = mid + 1 else hi = mid;
+        }
+        r.index = @intCast(lo);
+        return try r.next();
+    }
+
+    /// The block the reader stands in, from 0; it has given a posting.
+    pub fn block(r: *const Reader) u32 {
+        return r.entered - 1;
+    }
+
+    /// The frequencies of the block the reader stands in, by place in it;
+    /// it has given a posting of it.
+    pub fn blockFreqs(r: *const Reader) []const u32 {
+        aegis.assert.invariant(r.decoded, "a block's frequencies are read once it is decoded");
+        return r.freq_buffer[0..r.count];
+    }
+
+    /// The place in its block of the posting the reader gave last.
+    pub fn place(r: *const Reader) u8 {
+        aegis.assert.invariant(r.decoded and r.index > 0, "a posting was given");
+        return r.index - 1;
     }
 
     /// The impacts of the block the reader stands in: every posting of it

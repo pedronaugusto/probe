@@ -18,6 +18,9 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "index reader", .patterns = &.{"src/Reader.zig"} },
     .{ .name = "index merge", .patterns = &.{"src/merge.zig"} },
     .{ .name = "index", .patterns = &.{"src/Writer.zig"} },
+    .{ .name = "query base", .patterns = &.{ "src/bm25.zig", "src/query/Tree.zig", "src/query/phrase.zig" } },
+    .{ .name = "query", .patterns = &.{"src/query/exec.zig"} },
+    .{ .name = "query entry", .patterns = &.{"src/query.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
 
@@ -68,5 +71,10 @@ pub const required = [_][]const u8{
     "src/Reader.zig",
     "src/merge.zig",
     "src/Writer.zig",
+    "src/bm25.zig",
+    "src/query/Tree.zig",
+    "src/query/phrase.zig",
+    "src/query/exec.zig",
+    "src/query.zig",
     "src/probe.zig",
 };

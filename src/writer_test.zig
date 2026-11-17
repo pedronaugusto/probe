@@ -67,7 +67,7 @@ fn expectPruned(dir: std.Io.Dir, keep: u8) !void {
     for (generations.items) |g| {
         var name_buffer: [Manifest.name_bytes]u8 = undefined;
         const bytes = try dir.readFileAlloc(io, Manifest.name(&name_buffer, g), a, .unlimited);
-        const m = try Manifest.parse(a, .init(bytes), .{ .generation = g, .fields = &schema, .term_bytes = 255 });
+        const m = try Manifest.parse(a, .init(bytes), .{ .generation = g, .fields = try Manifest.fieldsOf(a, &schema), .term_bytes = 255 });
         for (m.segments) |s| {
             try numbers.put(a, s.number, {});
             if (s.deletions) |d| try deletions.put(a, .{ s.number, d.generation }, {});
@@ -232,4 +232,18 @@ test "an index opened with another schema is refused" {
     try testing.expectEqual(@as(usize, 1), f.place);
     try testing.expectEqualStrings("serial", f.recorded.?.name);
     try testing.expectEqual(null, f.asked);
+}
+
+test "a field's scoring parameters are not recorded: an index opens with any" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var w: Writer = try .open(testing.allocator, io, tmp.dir, &schema, .{});
+    _ = try w.commit(io);
+    w.deinit(io);
+    var other = schema;
+    other[0].bm25 = .{ .k1 = 0.9, .b = 0.4 };
+    var again: Writer = try .open(testing.allocator, io, tmp.dir, &other, .{});
+    again.deinit(io);
+    var r = try Reader.open(testing.allocator, io, tmp.dir, &other, .{});
+    r.deinit();
 }

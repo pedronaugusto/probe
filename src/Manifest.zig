@@ -36,8 +36,31 @@ generation: u64,
 next_segment: u64,
 /// The longest term the index holds, in bytes (`Limits.term_bytes`).
 term_bytes: u16,
-fields: []const Schema.Field,
+fields: []const Field,
 segments: []const Segment,
+
+/// A field as a manifest records it: what the index's files depend on. A
+/// field's scoring parameters are read when a query is scored and are not
+/// recorded, so an index opens with any.
+pub const Field = struct {
+    name: []const u8,
+    kind: Schema.Kind,
+    positions: bool = false,
+    offsets: bool = false,
+    analysis: Schema.Analysis = .words,
+    stored: bool = false,
+
+    pub fn of(f: Schema.Field) Field {
+        return .{ .name = f.name, .kind = f.kind, .positions = f.positions, .offsets = f.offsets, .analysis = f.analysis, .stored = f.stored };
+    }
+};
+
+/// The fields of `schema` as a manifest records them, on `arena`.
+pub fn fieldsOf(arena: Allocator, schema: []const Schema.Field) Allocator.Error![]const Field {
+    const out = try arena.alloc(Field, schema.len);
+    for (schema, out) |f, *o| o.* = .of(f);
+    return out;
+}
 
 /// A live segment.
 pub const Segment = struct {
@@ -109,7 +132,7 @@ pub const ParseError = error{
 pub const Expected = struct {
     /// The generation its name says.
     generation: u64,
-    fields: []const Schema.Field,
+    fields: []const Field,
     term_bytes: u16,
     /// Told what differs when the manifest is `SchemaMismatch`.
     mismatch: ?*Mismatch = null,
@@ -127,7 +150,7 @@ pub const Mismatch = struct {
 
     pub const What = union(enum) {
         /// A side that has no field at `place` is null.
-        field: struct { place: usize, recorded: ?Schema.Field, asked: ?Schema.Field },
+        field: struct { place: usize, recorded: ?Field, asked: ?Field },
         term_bytes: struct { recorded: u16, asked: u16 },
     };
 };
@@ -158,7 +181,7 @@ fn read(c: Context, bytes: []const u8) ParseError!Manifest {
     if (m.generation != c.expected.generation) return error.Corrupt;
     if (firstDifference(m.fields, c.expected.fields)) |place| {
         if (c.expected.mismatch) |out| {
-            var recorded: ?Schema.Field = if (place < m.fields.len) m.fields[place] else null;
+            var recorded: ?Field = if (place < m.fields.len) m.fields[place] else null;
             if (recorded) |*r| {
                 const len = @min(r.name.len, Mismatch.max_name_bytes);
                 @memcpy(out.name_buffer[0..len], r.name[0..len]);
@@ -186,7 +209,7 @@ fn read(c: Context, bytes: []const u8) ParseError!Manifest {
 
 /// The first place where `got` and `want` differ, or one has a field the
 /// other has not; null when they are the same.
-fn firstDifference(got: []const Schema.Field, want: []const Schema.Field) ?usize {
+fn firstDifference(got: []const Field, want: []const Field) ?usize {
     for (0..@min(got.len, want.len)) |place| {
         const g = got[place];
         const w = want[place];

@@ -19,7 +19,8 @@ const Entry = struct {
         .fields = .{
             .at = .{ .numeric = .{} },
             .level = .{ .keyword = .{ .stored = true } },
-            .message = .{ .text = .{ .positions = true, .offsets = true, .analysis = .words_and_identifiers } },
+            .message = .{ .text = .{ .positions = true, .offsets = true, .analysis = .words_and_identifiers, .bm25 = .{ .k1 = 0.9 } } },
+            .note = .{ .text = .{} },
         },
     };
 };
@@ -27,7 +28,7 @@ const Entry = struct {
 test "a document type's declaration is its schema, its fields in the order declared" {
     const S = Schema.Of(Entry);
     try testing.expectEqualStrings("seq", S.id_field);
-    try testing.expectEqual(@as(usize, 3), S.all.len);
+    try testing.expectEqual(@as(usize, 4), S.all.len);
     try testing.expectEqualStrings("at", S.all[0].name);
     try testing.expectEqual(Schema.Kind.numeric, S.all[0].kind);
     try testing.expectEqual(Schema.Kind.keyword, S.all[1].kind);
@@ -37,6 +38,9 @@ test "a document type's declaration is its schema, its fields in the order decla
     try testing.expect(message.positions and message.offsets);
     try testing.expectEqual(Schema.Analysis.words_and_identifiers, message.analysis);
     try testing.expect(!message.stored);
+    // BM25's parameters as declared, a missing one at its default.
+    try testing.expectEqual(Schema.Bm25{ .k1 = 0.9, .b = 0.75 }, message.bm25);
+    try testing.expectEqual(Schema.Bm25{}, S.all[S.indexOf("note")].bm25);
 }
 
 test "numeric values keep their order as their columns' integers" {

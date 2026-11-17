@@ -5,12 +5,11 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const Manifest = @import("Manifest.zig");
-const Schema = @import("Schema.zig");
 
 const testing = std.testing;
 const gen = shakedown.gen;
 
-const schema = [_]Schema.Field{
+const schema = [_]Manifest.Field{
     .{ .name = "message", .kind = .text, .positions = true, .offsets = true, .analysis = .words_and_identifiers },
     .{ .name = "level", .kind = .keyword, .stored = true },
     .{ .name = "at", .kind = .numeric, .stored = true },
@@ -58,7 +57,7 @@ fn expectSame(want: Manifest, got: Manifest) !void {
     try testing.expectEqual(want.fields.len, got.fields.len);
     for (want.fields, got.fields) |w, g| {
         try testing.expectEqualStrings(w.name, g.name);
-        try testing.expectEqual(Schema.Field{ .name = "", .kind = w.kind, .positions = w.positions, .offsets = w.offsets, .analysis = w.analysis, .stored = w.stored }, Schema.Field{ .name = "", .kind = g.kind, .positions = g.positions, .offsets = g.offsets, .analysis = g.analysis, .stored = g.stored });
+        try testing.expectEqual(Manifest.Field{ .name = "", .kind = w.kind, .positions = w.positions, .offsets = w.offsets, .analysis = w.analysis, .stored = w.stored }, Manifest.Field{ .name = "", .kind = g.kind, .positions = g.positions, .offsets = g.offsets, .analysis = g.analysis, .stored = g.stored });
     }
     try testing.expectEqualSlices(Manifest.Segment, want.segments, got.segments);
 }
@@ -86,7 +85,7 @@ fn breaks(_: void, case: *shakedown.Case) anyerror!void {
     var mismatch: Manifest.Mismatch = .{};
     var expected = expectedOf(m);
     expected.mismatch = &mismatch;
-    var other_fields: [schema.len]Schema.Field = undefined;
+    var other_fields: [schema.len]Manifest.Field = undefined;
     const broken = gen.enumValue(s, Broken);
     const want: Manifest.ParseError = switch (broken) {
         .generation => blk: {
@@ -167,8 +166,8 @@ fn breaks(_: void, case: *shakedown.Case) anyerror!void {
 fn expectMismatch(got: Manifest.Mismatch, recorded: Manifest, asked: Manifest.Expected) !void {
     const fields = @min(recorded.fields.len, asked.fields.len);
     for (0..fields + 1) |place| {
-        const r: ?Schema.Field = if (place < recorded.fields.len) recorded.fields[place] else null;
-        const a: ?Schema.Field = if (place < asked.fields.len) asked.fields[place] else null;
+        const r: ?Manifest.Field = if (place < recorded.fields.len) recorded.fields[place] else null;
+        const a: ?Manifest.Field = if (place < asked.fields.len) asked.fields[place] else null;
         if (r == null and a == null) break;
         if (r != null and a != null and std.mem.eql(u8, r.?.name, a.?.name) and std.meta.eql(withoutName(r.?), withoutName(a.?))) continue;
         const f = got.what.field;
@@ -185,7 +184,7 @@ fn expectMismatch(got: Manifest.Mismatch, recorded: Manifest, asked: Manifest.Ex
     try testing.expectEqual(Manifest.Mismatch.What{ .term_bytes = .{ .recorded = recorded.term_bytes, .asked = asked.term_bytes } }, got.what);
 }
 
-fn withoutName(f: Schema.Field) Schema.Field {
+fn withoutName(f: Manifest.Field) Manifest.Field {
     var copy = f;
     copy.name = "";
     return copy;

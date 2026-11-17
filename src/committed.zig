@@ -56,7 +56,7 @@ pub fn manifest(arena: Allocator, io: Io, dir: Io.Dir, generation: u64, asked: A
     const bytes = try segment.source.readWhole(io, file, arena);
     return Manifest.parse(arena, .init(bytes), .{
         .generation = generation,
-        .fields = asked.fields,
+        .fields = try Manifest.fieldsOf(arena, asked.fields),
         .term_bytes = asked.term_bytes,
         .mismatch = asked.mismatch,
     });

@@ -338,7 +338,7 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
         .generation = generation,
         .next_segment = w.next_segment,
         .term_bytes = w.options.term_bytes,
-        .fields = w.schema,
+        .fields = try Manifest.fieldsOf(a, w.schema),
         .segments = entries.items,
     };
     var manifest_bytes: std.Io.Writer.Allocating = .init(a);
@@ -519,7 +519,7 @@ pub fn mergeStep(w: *Writer, io: Io, diagnostic: ?*merge.Diagnostic) MergeError!
         .generation = generation,
         .next_segment = number + 1,
         .term_bytes = w.options.term_bytes,
-        .fields = w.schema,
+        .fields = try Manifest.fieldsOf(a, w.schema),
         .segments = entries.items,
     };
     var manifest_bytes: std.Io.Writer.Allocating = .init(a);

@@ -13,8 +13,11 @@
 //! `id` names the field holding the document's id, a `u64` or an aegis id
 //! of `u64`. Each field is a field of the type: `text` and `keyword` of
 //! `[]const u8`, `numeric` of `u64`, `i64` or an aegis scalar of either
-//! (an instant, a count, an id). A declaration that cannot work does not
-//! compile, and says why.
+//! (an instant, a count, an id). A text field may set its BM25 parameters,
+//! `.bm25 = .{ .k1 = 1.2, .b = 0.75 }` (those by default): they are read
+//! when a query is scored and never stored, so changing them changes
+//! scores and never makes an index `SchemaMismatch`. A declaration that
+//! cannot work does not compile, and says why.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
@@ -39,6 +42,14 @@ pub const Analysis = enum {
     words_and_identifiers,
 };
 
+/// A text field's BM25 parameters, read when a query is scored.
+pub const Bm25 = struct {
+    /// How fast a term's weight saturates with its frequency; at least 0.
+    k1: f32 = 1.2,
+    /// How much a document's length against the average lowers it; 0 to 1.
+    b: f32 = 0.75,
+};
+
 /// One field as declared.
 pub const Field = struct {
     name: []const u8,
@@ -47,6 +58,8 @@ pub const Field = struct {
     offsets: bool = false,
     analysis: Analysis = .words,
     stored: bool = false,
+    /// Never stored: an index is opened with any.
+    bm25: Bm25 = .{},
 };
 
 /// The schema `Doc` declares.
@@ -98,6 +111,18 @@ fn fieldOf(comptime Doc: type, comptime name: []const u8, comptime spec: anytype
             field.offsets = value;
         } else if (comptime std.mem.eql(u8, option, "analysis")) {
             field.analysis = value;
+        } else if (comptime std.mem.eql(u8, option, "bm25")) {
+            // A declaration's literal has a type of its own: read it field
+            // by field, so `.{ .k1 = 0.9 }` keeps `b`'s default.
+            inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |param| {
+                if (comptime std.mem.eql(u8, param, "k1")) {
+                    field.bm25.k1 = @field(value, param);
+                } else if (comptime std.mem.eql(u8, param, "b")) {
+                    field.bm25.b = @field(value, param);
+                } else @compileError("probe: the field `" ++ name ++ "` has a .bm25 of .k1 and .b, not ." ++ param);
+            }
+            if (!(std.math.isFinite(field.bm25.k1) and field.bm25.k1 >= 0)) @compileError("probe: the field `" ++ name ++ "` has a .bm25 k1 that is finite and at least 0");
+            if (!(field.bm25.b >= 0 and field.bm25.b <= 1)) @compileError("probe: the field `" ++ name ++ "` has a .bm25 b from 0 to 1");
         } else @compileError("probe: the field `" ++ name ++ "` has no option ." ++ option);
     }
     if (field.offsets and !field.positions) @compileError("probe: the field `" ++ name ++ "` keeps offsets only with its positions");
