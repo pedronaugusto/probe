@@ -57,6 +57,8 @@ pub const Options = struct {
     keep_commits: u8 = 2,
     /// The most a stored block decodes to.
     max_block: u32 = 16 * 1024 * 1024 + segment.store.block_bytes,
+    /// Told what differs when the index is `SchemaMismatch`.
+    mismatch: ?*Manifest.Mismatch = null,
 };
 
 pub const OpenError = error{ Locked, NotFound, Corrupt, VersionTooNew, SchemaMismatch, ReadFailed, WriteFailed, Canceled, OutOfMemory };
@@ -173,7 +175,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, o
     errdefer w.dropSegments(io);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    if (try newestManifest(arena.allocator(), io, dir, schema, options.term_bytes)) |m| {
+    if (try newestManifest(arena.allocator(), io, dir, schema, options.term_bytes, options.mismatch)) |m| {
         w.generation = m.generation;
         w.next_segment = m.next_segment;
         try w.live.ensureTotalCapacity(gpa, m.segments.len);
@@ -210,7 +212,7 @@ fn dropSegments(w: *Writer, io: Io) void {
 
 /// The newest manifest in `dir` read on `arena`, or null in a directory
 /// that has none.
-pub fn newestManifest(arena: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, term_bytes: u16) (OpenError)!?Manifest {
+pub fn newestManifest(arena: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, term_bytes: u16, mismatch: ?*Manifest.Mismatch) OpenError!?Manifest {
     var newest: ?u64 = null;
     var it = dir.iterate();
     while (it.next(io) catch |err| return listed(err)) |entry| {
@@ -218,10 +220,10 @@ pub fn newestManifest(arena: Allocator, io: Io, dir: Io.Dir, schema: []const Sch
         if (newest == null or generation > newest.?) newest = generation;
     }
     const generation = newest orelse return null;
-    return try readManifest(arena, io, dir, generation, schema, term_bytes);
+    return try readManifest(arena, io, dir, generation, schema, term_bytes, mismatch);
 }
 
-fn readManifest(arena: Allocator, io: Io, dir: Io.Dir, generation: u64, schema: []const Schema.Field, term_bytes: u16) OpenError!Manifest {
+fn readManifest(arena: Allocator, io: Io, dir: Io.Dir, generation: u64, schema: []const Schema.Field, term_bytes: u16, mismatch: ?*Manifest.Mismatch) OpenError!Manifest {
     var name_buffer: [Manifest.name_bytes]u8 = undefined;
     const file = dir.openFile(io, Manifest.name(&name_buffer, generation), .{}) catch |err| switch (err) {
         error.FileNotFound => return error.NotFound,
@@ -230,7 +232,7 @@ fn readManifest(arena: Allocator, io: Io, dir: Io.Dir, generation: u64, schema: 
     };
     defer file.close(io);
     const bytes = try segment.source.readWhole(io, file, arena);
-    return Manifest.parse(arena, .init(bytes), .{ .generation = generation, .fields = schema, .term_bytes = term_bytes });
+    return Manifest.parse(arena, .init(bytes), .{ .generation = generation, .fields = schema, .term_bytes = term_bytes, .mismatch = mismatch });
 }
 
 fn listed(err: Io.Dir.Iterator.Error) OpenError {
@@ -455,7 +457,7 @@ fn prune(w: *Writer, io: Io) PruneError!void {
     // What the kept manifests name: each segment, and its deletions file.
     var named: std.AutoHashMapUnmanaged(files.Named, void) = .empty;
     for (generations.items[0..keep]) |g| {
-        const m = readManifest(a, io, dir, g, w.schema, w.options.term_bytes) catch |err| switch (err) {
+        const m = readManifest(a, io, dir, g, w.schema, w.options.term_bytes, null) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
             // A kept manifest that cannot be read keeps everything.

@@ -111,6 +111,25 @@ pub const Expected = struct {
     generation: u64,
     fields: []const Schema.Field,
     term_bytes: u16,
+    /// Told what differs when the manifest is `SchemaMismatch`.
+    mismatch: ?*Mismatch = null,
+};
+
+/// What differs in a manifest that is `SchemaMismatch`: the first field, by
+/// place, recorded otherwise than asked or held by one of them alone, or
+/// else the term length; each as recorded and as asked.
+pub const Mismatch = struct {
+    what: What = undefined,
+    /// Holds the recorded field's name, cut to its length.
+    name_buffer: [max_name_bytes]u8 = undefined,
+
+    pub const max_name_bytes = 128;
+
+    pub const What = union(enum) {
+        /// A side that has no field at `place` is null.
+        field: struct { place: usize, recorded: ?Schema.Field, asked: ?Schema.Field },
+        term_bytes: struct { recorded: u16, asked: u16 },
+    };
 };
 
 const Context = struct {
@@ -137,7 +156,22 @@ fn read(c: Context, bytes: []const u8) ParseError!Manifest {
         else => return error.Corrupt,
     };
     if (m.generation != c.expected.generation) return error.Corrupt;
-    if (m.term_bytes != c.expected.term_bytes or !sameFields(m.fields, c.expected.fields)) return error.SchemaMismatch;
+    if (firstDifference(m.fields, c.expected.fields)) |place| {
+        if (c.expected.mismatch) |out| {
+            var recorded: ?Schema.Field = if (place < m.fields.len) m.fields[place] else null;
+            if (recorded) |*r| {
+                const len = @min(r.name.len, Mismatch.max_name_bytes);
+                @memcpy(out.name_buffer[0..len], r.name[0..len]);
+                r.name = out.name_buffer[0..len];
+            }
+            out.what = .{ .field = .{ .place = place, .recorded = recorded, .asked = if (place < c.expected.fields.len) c.expected.fields[place] else null } };
+        }
+        return error.SchemaMismatch;
+    }
+    if (m.term_bytes != c.expected.term_bytes) {
+        if (c.expected.mismatch) |out| out.what = .{ .term_bytes = .{ .recorded = m.term_bytes, .asked = c.expected.term_bytes } };
+        return error.SchemaMismatch;
+    }
     var before: ?u64 = null;
     for (m.segments) |s| {
         if (before) |b| if (s.number <= b) return error.Corrupt;
@@ -150,11 +184,14 @@ fn read(c: Context, bytes: []const u8) ParseError!Manifest {
     return m;
 }
 
-fn sameFields(got: []const Schema.Field, want: []const Schema.Field) bool {
-    if (got.len != want.len) return false;
-    for (got, want) |g, w| {
+/// The first place where `got` and `want` differ, or one has a field the
+/// other has not; null when they are the same.
+fn firstDifference(got: []const Schema.Field, want: []const Schema.Field) ?usize {
+    for (0..@min(got.len, want.len)) |place| {
+        const g = got[place];
+        const w = want[place];
         if (!std.mem.eql(u8, g.name, w.name) or g.kind != w.kind or g.positions != w.positions or
-            g.offsets != w.offsets or g.analysis != w.analysis or g.stored != w.stored) return false;
+            g.offsets != w.offsets or g.analysis != w.analysis or g.stored != w.stored) return place;
     }
-    return true;
+    return if (got.len == want.len) null else @min(got.len, want.len);
 }

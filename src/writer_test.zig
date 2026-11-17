@@ -182,5 +182,11 @@ test "an index opened with another schema is refused" {
     var w: Writer = try .open(testing.allocator, io, tmp.dir, &schema, .{});
     _ = try w.commit(io);
     w.deinit(io);
-    try testing.expectError(error.SchemaMismatch, Writer.open(testing.allocator, io, tmp.dir, schema[0..1], .{}));
+    var mismatch: Manifest.Mismatch = .{};
+    try testing.expectError(error.SchemaMismatch, Writer.open(testing.allocator, io, tmp.dir, schema[0..1], .{ .mismatch = &mismatch }));
+    // The first field that differs: one the index recorded and was not asked for.
+    const f = mismatch.what.field;
+    try testing.expectEqual(@as(usize, 1), f.place);
+    try testing.expectEqualStrings("serial", f.recorded.?.name);
+    try testing.expectEqual(null, f.asked);
 }

@@ -83,7 +83,9 @@ fn breaks(_: void, case: *shakedown.Case) anyerror!void {
     const s = case.source;
     var segments: [12]Manifest.Segment = undefined;
     var m = manifestOf(s, &segments);
-    const expected = expectedOf(m);
+    var mismatch: Manifest.Mismatch = .{};
+    var expected = expectedOf(m);
+    expected.mismatch = &mismatch;
     var other_fields: [schema.len]Schema.Field = undefined;
     const broken = gen.enumValue(s, Broken);
     const want: Manifest.ParseError = switch (broken) {
@@ -96,7 +98,9 @@ fn breaks(_: void, case: *shakedown.Case) anyerror!void {
             break :blk error.SchemaMismatch;
         },
         .fields => blk: {
-            m.fields = if (m.fields.len == schema.len) schema[0 .. schema.len - 1] else schema[0 .. m.fields.len + 1];
+            // Any other count of the same fields.
+            const other = (m.fields.len + gen.intRange(s, usize, 1, schema.len)) % (schema.len + 1);
+            m.fields = schema[0..other];
             break :blk error.SchemaMismatch;
         },
         .field => blk: {
@@ -155,6 +159,36 @@ fn breaks(_: void, case: *shakedown.Case) anyerror!void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(want, Manifest.parse(arena.allocator(), .init(bytes), expected));
+    if (want == error.SchemaMismatch) try expectMismatch(mismatch, m, expected);
+}
+
+/// The diagnostic names the first field, by place, that `recorded` and
+/// `asked` hold otherwise or one of them alone, or else the term length.
+fn expectMismatch(got: Manifest.Mismatch, recorded: Manifest, asked: Manifest.Expected) !void {
+    const fields = @min(recorded.fields.len, asked.fields.len);
+    for (0..fields + 1) |place| {
+        const r: ?Schema.Field = if (place < recorded.fields.len) recorded.fields[place] else null;
+        const a: ?Schema.Field = if (place < asked.fields.len) asked.fields[place] else null;
+        if (r == null and a == null) break;
+        if (r != null and a != null and std.mem.eql(u8, r.?.name, a.?.name) and std.meta.eql(withoutName(r.?), withoutName(a.?))) continue;
+        const f = got.what.field;
+        try testing.expectEqual(place, f.place);
+        try testing.expectEqual(r == null, f.recorded == null);
+        try testing.expectEqual(a == null, f.asked == null);
+        if (r) |field| {
+            try testing.expectEqualStrings(field.name, f.recorded.?.name);
+            try testing.expectEqual(withoutName(field), withoutName(f.recorded.?));
+        }
+        if (a) |field| try testing.expectEqualStrings(field.name, f.asked.?.name);
+        return;
+    }
+    try testing.expectEqual(Manifest.Mismatch.What{ .term_bytes = .{ .recorded = recorded.term_bytes, .asked = asked.term_bytes } }, got.what);
+}
+
+fn withoutName(f: Schema.Field) Schema.Field {
+    var copy = f;
+    copy.name = "";
+    return copy;
 }
 
 test "each rule a manifest breaks is refused with its error" {
