@@ -1,7 +1,7 @@
 //! A segment read back from its files' bodies, each already checked by
 //! `files.Expected.check`: the term dictionary, the postings and positions
 //! a term's addresses lead to, each document's length in each text field,
-//! the ids, and each numeric field's column.
+//! the ids, each numeric field's column, and each document's stored values.
 //!
 //! What `write.zig` wrote is checked as it is read: the lengths and ids
 //! against the documents, a term's addresses against the files they point
@@ -17,6 +17,7 @@ const postings = @import("postings.zig");
 const positions = @import("positions.zig");
 const terms = @import("terms.zig");
 const columns = @import("columns.zig");
+const store = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -30,6 +31,7 @@ pub const Bodies = struct {
     lengths: []const u8,
     ids: []const u8,
     columns: []const u8,
+    store: []const u8,
 };
 
 /// A term's postings, and its positions when its field keeps them.
@@ -55,12 +57,14 @@ pub const Segment = struct {
     lengths: []?Lengths,
     /// By place; a field that is not numeric has none.
     columns: []?columns.Column,
+    stored: store.Store,
     id_column: []const u8,
     id_map: fst.Fst,
 
-    /// The segment `bodies` hold, of documents of `schema`. Its structure
-    /// is checked here; a term's postings and positions when they are read.
-    pub fn parse(gpa: Allocator, bodies: Bodies, schema: []const Schema.Field) (Error || Allocator.Error)!Segment {
+    /// The segment `bodies` hold, of documents of `schema`, its stored
+    /// blocks decoding to at most `max_block` bytes each. Its structure is
+    /// checked here; a term's postings and positions when they are read.
+    pub fn parse(gpa: Allocator, bodies: Bodies, schema: []const Schema.Field, max_block: u32) (Error || Allocator.Error)!Segment {
         var at: usize = 0;
         const docs: u32 = @intCast(try varint.readAtMost(bodies.ids, &at, std.math.maxInt(u32)));
         const column_bytes = @as(usize, docs) * 8;
@@ -80,6 +84,7 @@ pub const Segment = struct {
         try readColumns(bodies.columns, schema, docs, cols);
 
         const dictionary = try terms.Dictionary.parse(bodies.terms, @intCast(schema.len));
+        const stored = try store.Store.parse(bodies.store, docs, schema, max_block);
         return .{
             .schema = schema,
             .docs = docs,
@@ -88,6 +93,7 @@ pub const Segment = struct {
             .positions = bodies.positions,
             .lengths = lengths,
             .columns = cols,
+            .stored = stored,
             .id_column = id_column,
             .id_map = id_map,
         };
@@ -114,6 +120,12 @@ pub const Segment = struct {
             at += len;
         }
         if (at != body.len) return error.Corrupt;
+    }
+
+    /// `doc`'s stored values, one per stored field in order, into `out`; a
+    /// text or keyword value points into `buffer`, valid until it changes.
+    pub fn storedOf(s: *const Segment, gpa: Allocator, doc: u32, buffer: *std.ArrayList(u8), out: []store.Value) (Error || Allocator.Error)!void {
+        return s.stored.read(gpa, doc, buffer, out);
     }
 
     /// The column of the numeric field at `place`.

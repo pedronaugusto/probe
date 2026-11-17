@@ -21,6 +21,7 @@
 //!     columns   the numeric fields, a varint; per numeric field, rising by
 //!               place: its place and its column's length, varints, and
 //!               its column (`columns.zig`)
+//!     store     the stored fields' values (`store.zig`)
 //!
 //! The term dictionary, postings and positions are `terms.zig`'s,
 //! `postings.zig`'s and `positions.zig`'s.
@@ -36,6 +37,7 @@ const files = @import("files.zig");
 const postings = @import("postings.zig");
 const positions = @import("positions.zig");
 const columns = @import("columns.zig");
+const store = @import("store.zig");
 const terms = @import("terms.zig");
 
 const Allocator = std.mem.Allocator;
@@ -61,8 +63,10 @@ pub const Files = struct {
     lengths: std.ArrayList(u8) = .empty,
     ids: std.ArrayList(u8) = .empty,
     columns: std.ArrayList(u8) = .empty,
+    store: std.ArrayList(u8) = .empty,
 
     pub fn deinit(f: *Files, gpa: Allocator) void {
+        f.store.deinit(gpa);
         f.terms.deinit(gpa);
         f.postings.deinit(gpa);
         f.positions.deinit(gpa);
@@ -80,7 +84,8 @@ pub const Files = struct {
             .lengths => f.lengths.items,
             .ids => f.ids.items,
             .columns => f.columns.items,
-            .store, .deletions => &.{},
+            .store => f.store.items,
+            .deletions => &.{},
         };
     }
 };
@@ -112,6 +117,9 @@ pub const Builder = struct {
     term_buffer: []u8,
     ids: std.ArrayList(u64) = .empty,
     docs: u32 = 0,
+    store: store.Writer,
+    /// A document's stored values, gathered for the store.
+    stored: []store.Value,
 
     /// A builder for documents of `schema`, each term cut to `term_bytes`.
     pub fn init(gpa: Allocator, schema: []const Schema.Field, term_bytes: u16) Allocator.Error!Builder {
@@ -119,7 +127,10 @@ pub const Builder = struct {
         errdefer gpa.free(fields);
         @memset(fields, .{});
         const term_buffer = try gpa.alloc(u8, term_bytes);
-        return .{ .gpa = gpa, .arena = .init(gpa), .schema = schema, .fields = fields, .term_buffer = term_buffer };
+        errdefer gpa.free(term_buffer);
+        const stored = try gpa.alloc(store.Value, schema.len);
+        errdefer gpa.free(stored);
+        return .{ .gpa = gpa, .arena = .init(gpa), .schema = schema, .fields = fields, .term_buffer = term_buffer, .store = try .init(gpa), .stored = stored };
     }
 
     pub fn deinit(b: *Builder) void {
@@ -136,6 +147,8 @@ pub const Builder = struct {
         b.gpa.free(b.fields);
         b.gpa.free(b.term_buffer);
         b.ids.deinit(b.gpa);
+        b.store.deinit();
+        b.gpa.free(b.stored);
         b.arena.deinit();
     }
 
@@ -162,6 +175,16 @@ pub const Builder = struct {
                 try field.column.append(b.gpa, number);
             },
         };
+        var n: usize = 0;
+        for (b.schema, doc.values) |schema, value| {
+            if (!schema.stored) continue;
+            b.stored[n] = switch (value) {
+                .text, .keyword => |bytes| .{ .bytes = bytes },
+                .numeric => |number| .{ .numeric = number },
+            };
+            n += 1;
+        }
+        try b.store.add(b.stored[0..n]);
         try b.ids.append(b.gpa, doc.id);
         b.docs += 1;
         return id;
@@ -252,6 +275,11 @@ pub const Builder = struct {
             try cols.appendSlice(gpa, column.items);
         }
         try frame(gpa, &out.columns, .columns, segment, cols.items);
+
+        var stored: std.ArrayList(u8) = .empty;
+        defer stored.deinit(gpa);
+        try b.store.finish(&stored);
+        try frame(gpa, &out.store, .store, segment, stored.items);
         return out;
     }
 

@@ -20,6 +20,9 @@ pub const terms = @import("segment/terms.zig");
 /// A numeric field's column, in blocks of 128 with their bounds.
 pub const columns = @import("segment/columns.zig");
 
+/// Stored fields, in LZ4 blocks of about 16 KiB.
+pub const store = @import("segment/store.zig");
+
 /// A segment built from documents and written as its files.
 pub const write = @import("segment/write.zig");
 

@@ -47,6 +47,8 @@ const Model = struct {
     lengths: [max_fields][max_docs]u32 = undefined,
     ids: [max_docs]u64 = undefined,
     numbers: [max_fields][max_docs]u64 = undefined,
+    /// Each document's stored values, in order of the stored fields.
+    kept: [max_docs][max_fields]segment.store.Value = undefined,
 
     fn note(m: *Model, place: usize, term: []const u8, doc: u32, token: positions.Token) !void {
         const a = m.arena.allocator();
@@ -72,6 +74,7 @@ fn schemaOf(s: *shakedown.Source, out: *[max_fields]Schema.Field) []Schema.Field
             .positions = keeps,
             .offsets = keeps and gen.boolean(s),
             .analysis = gen.enumValue(s, Schema.Analysis),
+            .stored = gen.boolean(s),
         };
     }
     return out[0..n];
@@ -122,6 +125,15 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
                 },
             }
         }
+        var kept: usize = 0;
+        for (schema, values[0..schema.len]) |f, v| {
+            if (!f.stored) continue;
+            model.kept[doc][kept] = switch (v) {
+                .text, .keyword => |bytes| .{ .bytes = try model.arena.allocator().dupe(u8, bytes) },
+                .numeric => |number| .{ .numeric = number },
+            };
+            kept += 1;
+        }
         model.ids[doc] = gen.intRange(s, u64, 0, 2 * docs);
         try testing.expectEqual(doc, try builder.add(.{ .id = model.ids[doc], .values = values[0..schema.len] }));
     }
@@ -130,12 +142,12 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     var out = try builder.finish(segment_number);
     defer out.deinit(gpa);
     var bodies: segment.read.Bodies = undefined;
-    inline for (.{ "terms", "postings", "positions", "lengths", "ids", "columns" }) |name| {
+    inline for (.{ "terms", "postings", "positions", "lengths", "ids", "columns", "store" }) |name| {
         const kind = @field(files.Kind, name);
         const e: files.Expected = .{ .kind = kind, .segment = segment_number };
         @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
     }
-    var seg = try segment.read.Segment.parse(gpa, bodies, schema);
+    var seg = try segment.read.Segment.parse(gpa, bodies, schema, 1 << 20);
     defer seg.deinit(gpa);
     try testing.expectEqual(docs, seg.docs);
 
@@ -170,6 +182,20 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
         try testing.expectEqual(last, (try seg.docOf(model.ids[d])).?);
     }
     if (docs == 0) try testing.expectEqual(null, try seg.docOf(7));
+
+    // Each document's stored values.
+    var stored: usize = 0;
+    for (schema) |f| stored += @intFromBool(f.stored);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    var got: [max_fields]segment.store.Value = undefined;
+    for (0..docs) |d| {
+        try seg.storedOf(gpa, @intCast(d), &buffer, got[0..stored]);
+        for (model.kept[d][0..stored], got[0..stored]) |want, value| switch (want) {
+            .bytes => |b| try testing.expectEqualSlices(u8, b, value.bytes),
+            .numeric => |n| try testing.expectEqual(n, value.numeric),
+        };
+    }
 }
 
 fn expectPostings(r: *segment.read.TermReader, want: []const ModelPosting, f: Schema.Field) !void {
@@ -206,7 +232,7 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
     const gpa = testing.allocator;
     var schema_buffer: [max_fields]Schema.Field = undefined;
     const schema = schemaOf(s, &schema_buffer);
-    var buffers: [6][128]u8 = undefined;
+    var buffers: [7][128]u8 = undefined;
     const bodies: segment.read.Bodies = .{
         .terms = gen.bytesInto(s, &buffers[0]),
         .postings = gen.bytesInto(s, &buffers[1]),
@@ -214,8 +240,9 @@ fn anyBodies(_: void, case: *shakedown.Case) anyerror!void {
         .lengths = gen.bytesInto(s, &buffers[3]),
         .ids = gen.bytesInto(s, &buffers[4]),
         .columns = gen.bytesInto(s, &buffers[5]),
+        .store = gen.bytesInto(s, &buffers[6]),
     };
-    var seg = segment.read.Segment.parse(gpa, bodies, schema) catch return;
+    var seg = segment.read.Segment.parse(gpa, bodies, schema, 1 << 20) catch return;
     defer seg.deinit(gpa);
     for (schema, 0..) |f, p| {
         const place: u32 = @intCast(p);
