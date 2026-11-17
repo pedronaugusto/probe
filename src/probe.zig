@@ -13,3 +13,6 @@ pub const bitpack = encoding.bitpack;
 /// built from keys in rising order: the term dictionary's and the external
 /// ids' map.
 pub const fst = encoding.fst;
+
+/// A set of a segment's doc ids, one bit each: a deletion generation.
+pub const bitmap = encoding.bitmap;

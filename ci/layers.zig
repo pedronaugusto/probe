@@ -2,7 +2,7 @@
 const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
-    .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig" } },
+    .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig", "src/encoding/bitmap.zig" } },
     .{ .name = "encoding entry", .patterns = &.{"src/encoding.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
@@ -27,6 +27,7 @@ pub const references: []const gantry.rules.ReferenceRule = &package_references;
 pub const required = [_][]const u8{
     "src/encoding/bitpack.zig",
     "src/encoding/fst.zig",
+    "src/encoding/bitmap.zig",
     "src/encoding.zig",
     "src/probe.zig",
 };

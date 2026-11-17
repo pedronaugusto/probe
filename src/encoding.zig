@@ -9,3 +9,6 @@ pub const bitpack = @import("encoding/bitpack.zig");
 
 /// A finite state transducer from byte strings to `u64`s.
 pub const fst = @import("encoding/fst.zig");
+
+/// A set of a segment's doc ids, one bit each.
+pub const bitmap = @import("encoding/bitmap.zig");
