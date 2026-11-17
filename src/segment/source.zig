@@ -12,7 +12,8 @@
 //!
 //! A range past the body is `error.Corrupt`: whatever names it lies. A file
 //! read that fails is `error.ReadFailed`, or `error.Canceled` when the `Io`
-//! cancels it.
+//! cancels it. `readWhole` reads a file held whole: every read of an
+//! index's files is here.
 //!
 //! This file is internal. `probe.zig` is the package.
 const std = @import("std");
@@ -111,3 +112,15 @@ pub const Window = struct {
         return w.bytes(buffer, offset, @intCast(@min(n, end - offset)));
     }
 };
+
+pub const WholeError = error{ ReadFailed, Canceled, OutOfMemory };
+
+/// Every byte of `file`, in memory from `gpa` the caller frees: for a file
+/// held whole, its bytes checked as a whole by the caller.
+pub fn readWhole(io: Io, file: Io.File, gpa: Allocator) WholeError![]u8 {
+    return aegis.own.readOpened(io, file, gpa, .fromRaw(std.math.maxInt(u64))) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => error.ReadFailed,
+    };
+}

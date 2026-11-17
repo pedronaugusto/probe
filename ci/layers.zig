@@ -12,7 +12,9 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "segment", .patterns = &.{ "src/segment/files.zig", "src/segment/postings.zig", "src/segment/positions.zig", "src/segment/terms.zig", "src/segment/columns.zig", "src/segment/store.zig" } },
     .{ .name = "segment whole", .patterns = &.{ "src/segment/write.zig", "src/segment/read.zig" } },
     .{ .name = "segment entry", .patterns = &.{"src/segment.zig"} },
-    .{ .name = "index", .patterns = &.{"src/Manifest.zig"} },
+    .{ .name = "index base", .patterns = &.{"src/Manifest.zig"} },
+    .{ .name = "index segment", .patterns = &.{"src/Opened.zig"} },
+    .{ .name = "index", .patterns = &.{"src/Writer.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
 
@@ -57,5 +59,7 @@ pub const required = [_][]const u8{
     "src/segment/read.zig",
     "src/segment.zig",
     "src/Manifest.zig",
+    "src/Opened.zig",
+    "src/Writer.zig",
     "src/probe.zig",
 };

@@ -80,6 +80,44 @@ pub fn name(buffer: *[max_name_bytes]u8, segment: u64, kind: Kind, generation: u
     } catch aegis.assert.never("a name fits max_name_bytes");
 }
 
+/// What a segment file's name says.
+pub const Named = struct {
+    segment: u64,
+    kind: Kind,
+    /// A deletions file's generation; 0 for every other kind.
+    generation: u64 = 0,
+};
+
+/// What `entry` names, if it is a segment file's name exactly as `name`
+/// writes it.
+pub fn parseName(entry: []const u8) ?Named {
+    if (entry.len < 18 or entry[16] != '.') return null;
+    const segment = hex(entry[0..16]) orelse return null;
+    const rest = entry[17..];
+    if (std.mem.startsWith(u8, rest, "del.")) {
+        if (rest.len != 4 + 16) return null;
+        return .{ .segment = segment, .kind = .deletions, .generation = hex(rest[4..][0..16]) orelse return null };
+    }
+    for (std.enums.values(Kind)) |kind| {
+        if (kind != .deletions and std.mem.eql(u8, rest, kind.extension())) return .{ .segment = segment, .kind = kind };
+    }
+    return null;
+}
+
+/// Sixteen lowercase hex digits' value.
+fn hex(digits: *const [16]u8) ?u64 {
+    var value: u64 = 0;
+    for (digits) |c| {
+        const digit: u64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            else => return null,
+        };
+        value = (value << 4) | digit;
+    }
+    return value;
+}
+
 /// The header of a file of `kind` for `segment`.
 pub fn header(kind: Kind, segment: u64) [header_bytes]u8 {
     var h: [header_bytes]u8 = @splat(0);

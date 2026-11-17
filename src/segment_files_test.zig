@@ -134,3 +134,22 @@ test "a file opened and verified is refused or read exactly as a check of its by
     defer f.deinit();
     try shakedown.check(testing.allocator, &f, openedAsChecked, .{ .seed = 0x6f70656e, .cases = 1500 });
 }
+
+fn namesBack(_: void, case: *shakedown.Case) anyerror!void {
+    const s = case.source;
+    var buffer: [files.max_name_bytes]u8 = undefined;
+    const kind = gen.enumValue(s, files.Kind);
+    const named: files.Named = .{ .segment = gen.int(s, u64), .kind = kind, .generation = if (kind == .deletions) gen.int(s, u64) else 0 };
+    try testing.expectEqual(named, files.parseName(files.name(&buffer, named.segment, named.kind, named.generation)).?);
+    // Any entry that parses is that name exactly.
+    const model = files.name(&buffer, gen.int(s, u64), gen.enumValue(s, files.Kind), gen.int(s, u64));
+    var entry: [files.max_name_bytes + 2]u8 = undefined;
+    const len = gen.intRange(s, usize, @max(model.len, 2) - 2, @min(model.len + 2, entry.len));
+    for (entry[0..len], 0..) |*c, i| c.* = if (i < model.len and gen.intRange(s, u8, 0, 9) != 0) model[i] else "0aF.delpostx"[gen.intRange(s, usize, 0, 11)];
+    var back: [files.max_name_bytes]u8 = undefined;
+    if (files.parseName(entry[0..len])) |n| try testing.expectEqualStrings(entry[0..len], files.name(&back, n.segment, n.kind, n.generation));
+}
+
+test "a segment file's name and what it names map one to one" {
+    try shakedown.check(testing.allocator, {}, namesBack, .{ .seed = 0x6e6d6573, .cases = 5000 });
+}

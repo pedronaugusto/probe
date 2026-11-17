@@ -18,4 +18,5 @@ test {
     _ = @import("segment_test.zig");
     _ = @import("manifest_test.zig");
     _ = @import("sources_test.zig");
+    _ = @import("writer_test.zig");
 }
