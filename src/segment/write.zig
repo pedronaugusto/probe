@@ -15,9 +15,11 @@
 //!               place: its place, a varint, the sum of its lengths, u64,
 //!               and each document's length, u32, little endian
 //!     ids       the documents, a varint; each document's id, u64 little
-//!               endian; then an FST from each id, eight bytes big endian
-//!               so their order is the ids', to its document (the last
-//!               added, when an id is added twice)
+//!               endian; each document added after another with its id,
+//!               a count, a varint, then by document, rising, the
+//!               document and the one before it with its id, u32 each,
+//!               little endian; then an FST from each id, eight bytes big
+//!               endian so their order is the ids', to its last document
 //!     columns   the numeric fields, a varint; per numeric field, rising by
 //!               place: its place and its column's length, varints, and
 //!               its column (`columns.zig`)
@@ -328,8 +330,7 @@ pub const Builder = struct {
         const gpa = b.gpa;
         try varint.append(gpa, out, b.docs);
         for (b.ids.items) |id| try appendInt(gpa, out, u64, id);
-        // Each id to its last document: sorted by id, then by doc, the last
-        // of each run kept.
+        // Sorted by id, then by doc: each run is an id's documents.
         const pairs = try gpa.alloc([2]u64, b.ids.items.len);
         defer gpa.free(pairs);
         for (pairs, b.ids.items, 0..) |*p, id, doc| p.* = .{ id, doc };
@@ -338,6 +339,26 @@ pub const Builder = struct {
                 return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1]);
             }
         }.lessThan);
+        // Each document added after another with its id, and that one, by doc.
+        var earlier: std.ArrayList([2]u32) = .empty;
+        defer earlier.deinit(gpa);
+        var later: usize = 1;
+        while (later < pairs.len) : (later += 1) {
+            const one = pairs[later - 1];
+            const two = pairs[later];
+            if (one[0] == two[0]) try earlier.append(gpa, .{ @intCast(two[1]), @intCast(one[1]) });
+        }
+        std.mem.sort([2]u32, earlier.items, {}, struct {
+            fn lessThan(_: void, x: [2]u32, y: [2]u32) bool {
+                return x[0] < y[0];
+            }
+        }.lessThan);
+        try varint.append(gpa, out, earlier.items.len);
+        for (earlier.items) |e| {
+            try appendInt(gpa, out, u32, e[0]);
+            try appendInt(gpa, out, u32, e[1]);
+        }
+        // Each id to its last document: the last of each run.
         var map: fst.Builder = .init(gpa);
         defer map.deinit();
         for (pairs, 0..) |p, i| {

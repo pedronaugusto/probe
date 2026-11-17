@@ -66,6 +66,9 @@ pub const Segment = struct {
     columns: []?columns.Column,
     stored: store.Store,
     id_column: []const u8,
+    /// Each document added after another with its id, and that one: pairs
+    /// of `u32`, rising by the first.
+    earlier: []const u8,
     id_map: fst.Fst,
 
     /// The segment `bodies` hold, of documents of `schema`, its stored
@@ -78,7 +81,13 @@ pub const Segment = struct {
         const column_bytes = @as(usize, docs) * 8;
         if (column_bytes > bodies.ids.len - at) return error.Corrupt;
         const id_column = bodies.ids[at..][0..column_bytes];
-        const id_map = try fst.Fst.parse(bodies.ids[at + column_bytes ..]);
+        at += column_bytes;
+        const earlier_count = try varint.readAtMost(bodies.ids, &at, docs);
+        const earlier_bytes: usize = @intCast(earlier_count * 8);
+        if (earlier_bytes > bodies.ids.len - at) return error.Corrupt;
+        const earlier = bodies.ids[at..][0..earlier_bytes];
+        try checkEarlier(earlier, id_column, docs);
+        const id_map = try fst.Fst.parse(bodies.ids[at + earlier_bytes ..]);
         if (id_map.keys > docs) return error.Corrupt;
 
         const lengths = try gpa.alloc(?Lengths, schema.len);
@@ -104,6 +113,7 @@ pub const Segment = struct {
             .columns = cols,
             .stored = stored,
             .id_column = id_column,
+            .earlier = earlier,
             .id_map = id_map,
         };
     }
@@ -212,4 +222,49 @@ pub const Segment = struct {
         if (doc >= s.docs or s.idOf(@intCast(doc)) != id) return error.Corrupt;
         return @intCast(doc);
     }
+
+    /// Every document added with `id`, the last first.
+    pub fn docsOf(s: *const Segment, id: u64) error{Corrupt}!DocsOf {
+        return .{ .segment = s, .doc = try s.docOf(id) };
+    }
+
+    /// The document added before `doc` with its id, if one was.
+    fn earlierOf(s: *const Segment, doc: u32) ?u32 {
+        var lo: usize = 0;
+        var hi: usize = s.earlier.len / 8;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const at = std.mem.readInt(u32, s.earlier[mid * 8 ..][0..4], .little);
+            if (at == doc) return std.mem.readInt(u32, s.earlier[mid * 8 + 4 ..][0..4], .little);
+            if (at < doc) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
 };
+
+/// The documents of an id in a segment, the last added first.
+pub const DocsOf = struct {
+    segment: *const Segment,
+    doc: ?u32,
+
+    pub fn next(d: *DocsOf) ?u32 {
+        const doc = d.doc orelse return null;
+        d.doc = d.segment.earlierOf(doc);
+        return doc;
+    }
+};
+
+/// The pairs of documents added one after another with an id: rising by
+/// the later, each inside the segment, the earlier before it and of the
+/// same id. So a walk from an id's last document back ends.
+fn checkEarlier(earlier: []const u8, id_column: []const u8, docs: u32) error{Corrupt}!void {
+    var last: ?u32 = null;
+    for (0..earlier.len / 8) |i| {
+        const doc = std.mem.readInt(u32, earlier[i * 8 ..][0..4], .little);
+        const prev = std.mem.readInt(u32, earlier[i * 8 + 4 ..][0..4], .little);
+        if (last) |l| if (doc <= l) return error.Corrupt;
+        if (doc >= docs or prev >= doc) return error.Corrupt;
+        if (!std.mem.eql(u8, id_column[@as(usize, doc) * 8 ..][0..8], id_column[@as(usize, prev) * 8 ..][0..8])) return error.Corrupt;
+        last = doc;
+    }
+}

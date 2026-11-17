@@ -170,15 +170,7 @@ fn againstModel(files: *Files, case: *shakedown.Case) anyerror!void {
             for (0..docs) |d| try testing.expectEqual(model.numbers[p][d], try cursor.get(@intCast(d)));
         }
     }
-    for (0..docs) |d| {
-        try testing.expectEqual(model.ids[d], seg.idOf(@intCast(d)));
-        var last: u32 = @intCast(d);
-        for (d + 1..docs) |later| if (model.ids[later] == model.ids[d]) {
-            last = @intCast(later);
-        };
-        try testing.expectEqual(last, (try seg.docOf(model.ids[d])).?);
-    }
-    if (docs == 0) try testing.expectEqual(null, try seg.docOf(7));
+    try expectIds(&seg, model.ids[0..docs]);
 
     // Each document's stored values.
     var stored: usize = 0;
@@ -193,6 +185,28 @@ fn againstModel(files: *Files, case: *shakedown.Case) anyerror!void {
             .numeric => |n| try testing.expectEqual(n, value.numeric),
         };
     }
+}
+
+/// Each document's id, each id's last document, and every document of an
+/// id, the last first.
+fn expectIds(seg: *const segment.read.Segment, ids: []const u64) !void {
+    const docs = ids.len;
+    for (0..docs) |d| {
+        try testing.expectEqual(ids[d], seg.idOf(@intCast(d)));
+        var last: u32 = @intCast(d);
+        for (d + 1..docs) |later| if (ids[later] == ids[d]) {
+            last = @intCast(later);
+        };
+        try testing.expectEqual(last, (try seg.docOf(ids[d])).?);
+        var walk = try seg.docsOf(ids[d]);
+        var want = docs;
+        while (want > 0) {
+            want -= 1;
+            if (ids[want] == ids[d]) try testing.expectEqual(@as(u32, @intCast(want)), walk.next().?);
+        }
+        try testing.expectEqual(null, walk.next());
+    }
+    if (docs == 0) try testing.expectEqual(null, try seg.docOf(7));
 }
 
 /// The bodies of the files `out` holds: those held in memory checked whole;
@@ -292,4 +306,57 @@ test "fuzz: any bodies are refused as a segment, or read within it" {
     var files: Files = .init();
     defer files.deinit();
     try shakedown.check(testing.allocator, &files, anyBodies, .{ .seed = 0x66757a7a, .cases = 3000 });
+}
+
+test "an id's earlier documents that lie are refused: one not before its later, of another id, or out of order" {
+    const gpa = testing.allocator;
+    const schema = [_]Schema.Field{.{ .name = "k", .kind = .keyword }};
+    var builder: write.Builder = try .init(gpa, &schema, 255);
+    defer builder.deinit();
+    for ([_]u64{ 5, 5, 9, 5 }) |id| _ = try builder.add(.{ .id = id, .values = &.{.{ .keyword = "a" }} });
+    var out = try builder.finish(1);
+    defer out.deinit(gpa);
+    var bodies: segment.read.Bodies = undefined;
+    inline for (.{ "terms", "lengths", "ids", "columns" }) |name| {
+        const kind = @field(segment_files.Kind, name);
+        const e: segment_files.Expected = .{ .kind = kind, .segment = 1 };
+        @field(bodies, name) = (try e.check(.init(out.of(kind)))).bytes;
+    }
+    inline for (.{ "postings", "positions", "store" }) |name| {
+        const kind = @field(segment_files.Kind, name);
+        const e: segment_files.Expected = .{ .kind = kind, .segment = 1 };
+        @field(bodies, name) = .{ .memory = (try e.check(.init(out.of(kind)))).bytes };
+    }
+    // The ids body: 4, four ids, 2, then the pairs (1, 0) and (3, 1).
+    const ids = try gpa.dupe(u8, bodies.ids);
+    defer gpa.free(ids);
+    const pairs = 1 + 4 * 8 + 1;
+    try testing.expectEqual(@as(u8, 2), ids[pairs - 1]);
+    bodies.ids = ids;
+    var seg = try segment.read.Segment.parse(gpa, io, bodies, &schema, 1 << 20);
+    var walk = try seg.docsOf(5);
+    for ([_]u32{ 3, 1, 0 }) |want| try testing.expectEqual(want, walk.next().?);
+    try testing.expectEqual(null, walk.next());
+    seg.deinit(gpa);
+    const Lie = struct { at: usize, value: u32 };
+    for ([_]Lie{
+        // Its earlier one at itself, or after it.
+        .{ .at = pairs + 4, .value = 1 },
+        .{ .at = pairs + 12, .value = 3 },
+        // Of another id.
+        .{ .at = pairs + 12, .value = 2 },
+        // Out of order, or past the documents.
+        .{ .at = pairs + 8, .value = 1 },
+        .{ .at = pairs + 8, .value = 4 },
+    }) |lie| {
+        const kept = ids[lie.at..][0..4].*;
+        std.mem.writeInt(u32, ids[lie.at..][0..4], lie.value, .little);
+        try testing.expectError(error.Corrupt, segment.read.Segment.parse(gpa, io, bodies, &schema, 1 << 20));
+        ids[lie.at..][0..4].* = kept;
+    }
+    // The pairs out of order, each true.
+    const first = ids[pairs..][0..8].*;
+    @memcpy(ids[pairs..][0..8], ids[pairs + 8 ..][0..8]);
+    ids[pairs + 8 ..][0..8].* = first;
+    try testing.expectError(error.Corrupt, segment.read.Segment.parse(gpa, io, bodies, &schema, 1 << 20));
 }
