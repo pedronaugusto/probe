@@ -16,3 +16,9 @@ pub const positions = @import("segment/positions.zig");
 /// The term dictionary: per field an FST from term to ordinal, and each
 /// ordinal's postings and positions addresses.
 pub const terms = @import("segment/terms.zig");
+
+/// A segment built from documents and written as its files.
+pub const write = @import("segment/write.zig");
+
+/// A segment read back from its files' bodies.
+pub const read = @import("segment/read.zig");

@@ -9,6 +9,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "encoding", .patterns = &.{ "src/encoding/bitpack.zig", "src/encoding/fst.zig", "src/encoding/bitmap.zig" } },
     .{ .name = "encoding entry", .patterns = &.{"src/encoding.zig"} },
     .{ .name = "segment", .patterns = &.{ "src/segment/files.zig", "src/segment/postings.zig", "src/segment/positions.zig", "src/segment/terms.zig" } },
+    .{ .name = "segment whole", .patterns = &.{ "src/segment/write.zig", "src/segment/read.zig" } },
     .{ .name = "segment entry", .patterns = &.{"src/segment.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
@@ -47,6 +48,8 @@ pub const required = [_][]const u8{
     "src/segment/postings.zig",
     "src/segment/positions.zig",
     "src/segment/terms.zig",
+    "src/segment/write.zig",
+    "src/segment/read.zig",
     "src/segment.zig",
     "src/probe.zig",
 };
