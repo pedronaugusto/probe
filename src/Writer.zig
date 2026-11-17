@@ -35,6 +35,9 @@ const airlock = @import("airlock");
 const Schema = @import("Schema.zig");
 const Manifest = @import("Manifest.zig");
 const Opened = @import("Opened.zig");
+const Held = @import("Held.zig");
+const Reader = @import("Reader.zig");
+const committed = @import("committed.zig");
 const bitmap = @import("encoding.zig").bitmap;
 const segment = @import("segment.zig");
 
@@ -70,15 +73,12 @@ pub const OpenError = error{ Locked, NotFound, Corrupt, VersionTooNew, SchemaMis
 pub const AddError = error{ Corrupt, ReadFailed, Canceled, OutOfMemory };
 pub const CommitError = AddError || airlock.Batch.Error || error{WriteFailed};
 
-/// A segment of the index: committed, held open from its files, or new
-/// since the last commit, held in memory.
+/// A segment of the index: committed, held open from its file, or new
+/// since the last commit, held in memory; held with the writer's readers.
 const Live = struct {
     number: u64,
     docs: u32,
-    held: union(enum) {
-        opened: Opened,
-        fresh: Fresh,
-    },
+    held: Held.Handle,
     /// Its deleted documents, once any is; their count; the generation of
     /// the deletions file that holds them, if committed; and whether they
     /// changed since.
@@ -90,17 +90,11 @@ const Live = struct {
     changed: bool = false,
 
     fn segmentOf(l: *const Live) *const read.Segment {
-        return switch (l.held) {
-            .opened => |*o| &o.segment,
-            .fresh => |*f| &f.segment,
-        };
+        return l.held.get().read();
     }
 
-    fn deinit(l: *Live, gpa: Allocator, io: Io) void {
-        switch (l.held) {
-            .opened => |*o| o.deinit(gpa, io),
-            .fresh => |*f| f.deinit(gpa),
-        }
+    fn deinit(l: *Live, gpa: Allocator) void {
+        l.held.release();
         if (l.deleted) |*d| d.deinit(gpa);
     }
 
@@ -110,18 +104,6 @@ const Live = struct {
         l.deleted.?.add(doc);
         l.deleted_count += 1;
         l.changed = true;
-    }
-};
-
-/// A segment built since the last commit: its file's bytes, and the
-/// segment read over them.
-const Fresh = struct {
-    file: std.ArrayList(u8),
-    segment: read.Segment,
-
-    fn deinit(f: *Fresh, gpa: Allocator) void {
-        f.segment.deinit(gpa);
-        f.file.deinit(gpa);
     }
 };
 
@@ -177,20 +159,25 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, o
         .generation = 0,
         .next_segment = 0,
     };
-    errdefer w.dropSegments(io);
+    errdefer w.dropSegments();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    if (try newestManifest(arena.allocator(), io, dir, schema, options.term_bytes, options.mismatch)) |m| {
+    const asked: committed.Asked = .{ .fields = schema, .term_bytes = options.term_bytes, .mismatch = options.mismatch };
+    if (try committed.newest(arena.allocator(), io, dir, asked)) |m| {
         w.generation = m.generation;
         w.next_segment = m.next_segment;
         try w.live.ensureTotalCapacity(gpa, m.segments.len);
         for (m.segments) |entry| {
-            var opened = try Opened.open(gpa, io, dir, schema, entry, options.max_block);
-            errdefer opened.deinit(gpa, io);
-            var live: Live = .{ .number = entry.number, .docs = entry.docs, .held = .{ .opened = opened }, .committed = true };
-            if (opened.deletions) |view| {
-                live.deleted = try .fromView(gpa, view);
-                live.deleted_count = view.count();
+            var held: Held.Handle = held: {
+                var opened = try Opened.open(gpa, io, dir, schema, entry, options.max_block);
+                errdefer opened.deinit(gpa, io);
+                break :held try .create(gpa, .{ .gpa = gpa, .io = io, .number = entry.number, .docs = entry.docs, .from = .{ .file = opened } });
+            };
+            errdefer held.release();
+            var live: Live = .{ .number = entry.number, .docs = entry.docs, .held = held, .committed = true };
+            if (try committed.deletions(gpa, io, dir, entry)) |deleted| {
+                live.deleted = deleted;
+                live.deleted_count = entry.deletions.?.count;
                 live.deletions_generation = entry.deletions.?.generation;
             }
             w.live.appendAssumeCapacity(live);
@@ -201,50 +188,48 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, o
 }
 
 /// Closes the writer and lets its lock go; what is not committed is
-/// dropped.
+/// dropped. Its snapshots stay open.
 pub fn deinit(w: *Writer, io: Io) void {
-    w.dropSegments(io);
+    w.dropSegments();
     w.lock.deinit(io);
     w.* = undefined;
 }
 
-fn dropSegments(w: *Writer, io: Io) void {
-    for (w.live.items) |*l| l.deinit(w.gpa, io);
+fn dropSegments(w: *Writer) void {
+    for (w.live.items) |*l| l.deinit(w.gpa);
     w.live.deinit(w.gpa);
     if (w.building) |*b| b.deinit();
     w.buffered.deinit(w.gpa);
 }
 
-/// The newest manifest in `dir` read on `arena`, or null in a directory
-/// that has none.
-pub fn newestManifest(arena: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, term_bytes: u16, mismatch: ?*Manifest.Mismatch) OpenError!?Manifest {
-    var newest: ?u64 = null;
-    var it = dir.iterate();
-    while (it.next(io) catch |err| return listed(err)) |entry| {
-        const generation = Manifest.generationOf(entry.name) orelse continue;
-        if (newest == null or generation > newest.?) newest = generation;
+/// A snapshot of the writer's segments as they stand: its last commit and
+/// what it closed since (`refresh`), not yet durable. What the writer does
+/// next leaves the snapshot as it is; `reopen` on it reads the newest
+/// commit.
+pub fn reader(w: *const Writer) Allocator.Error!Reader {
+    const segments = try w.gpa.alloc(Reader.Segment, w.live.items.len);
+    var made: usize = 0;
+    errdefer {
+        for (segments[0..made]) |*s| s.deinit(w.gpa);
+        w.gpa.free(segments);
     }
-    const generation = newest orelse return null;
-    return try readManifest(arena, io, dir, generation, schema, term_bytes, mismatch);
-}
-
-fn readManifest(arena: Allocator, io: Io, dir: Io.Dir, generation: u64, schema: []const Schema.Field, term_bytes: u16, mismatch: ?*Manifest.Mismatch) OpenError!Manifest {
-    var name_buffer: [Manifest.name_bytes]u8 = undefined;
-    const file = dir.openFile(io, Manifest.name(&name_buffer, generation), .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.NotFound,
-        error.Canceled => return error.Canceled,
-        else => return error.ReadFailed,
-    };
-    defer file.close(io);
-    const bytes = try segment.source.readWhole(io, file, arena);
-    return Manifest.parse(arena, .init(bytes), .{ .generation = generation, .fields = schema, .term_bytes = term_bytes, .mismatch = mismatch });
-}
-
-fn listed(err: Io.Dir.Iterator.Error) OpenError {
-    return switch (err) {
-        error.Canceled => error.Canceled,
-        error.SystemResources => error.OutOfMemory,
-        else => error.ReadFailed,
+    for (w.live.items, segments) |*l, *s| {
+        const deleted: ?bitmap.Bitmap = if (l.deleted) |d| try d.clone(w.gpa) else null;
+        s.* = .{
+            .held = l.held.retain(),
+            .deleted = deleted,
+            .deleted_count = l.deleted_count,
+            .deletions = if (l.deleted_count == 0) .none else if (l.changed) .unsaved else .{ .committed = l.deletions_generation.? },
+        };
+        made += 1;
+    }
+    return .{
+        .gpa = w.gpa,
+        .dir = w.dir,
+        .schema = w.schema,
+        .options = .{ .term_bytes = w.options.term_bytes, .max_block = w.options.max_block },
+        .generation = w.generation,
+        .segments = segments,
     };
 }
 
@@ -284,17 +269,22 @@ pub fn refresh(w: *Writer, io: Io) AddError!void {
     w.building_bytes = 0;
     if (b.docs == 0) return;
     const number = w.next_segment;
-    var out = try b.finish(number);
-    errdefer out.deinit(w.gpa);
-    // The bytes were written here a moment ago: a refusal is a bug.
-    const e: files.Expected = .{ .kind = .segment, .segment = number };
-    const sections = e.checkSegment(.init(out.items)) catch aegis.assert.never("a segment just built reads back");
-    var seg = read.Segment.parse(w.gpa, io, read.inMemory(sections), w.schema, w.options.max_block) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => aegis.assert.never("a segment just built reads back"),
+    var held: Held.Handle = held: {
+        var out = try b.finish(number);
+        errdefer out.deinit(w.gpa);
+        // The bytes were written here a moment ago: a refusal is a bug.
+        const e: files.Expected = .{ .kind = .segment, .segment = number };
+        const sections = e.checkSegment(.init(out.items)) catch aegis.assert.never("a segment just built reads back");
+        var seg = read.Segment.parse(w.gpa, io, read.inMemory(sections), w.schema, w.options.max_block) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => aegis.assert.never("a segment just built reads back"),
+        };
+        errdefer seg.deinit(w.gpa);
+        break :held try .create(w.gpa, .{ .gpa = w.gpa, .io = io, .number = number, .docs = b.docs, .from = .{ .memory = .{ .file = out, .segment = seg } } });
     };
-    errdefer seg.deinit(w.gpa);
-    var live: Live = .{ .number = number, .docs = b.docs, .held = .{ .fresh = .{ .file = out, .segment = seg } }, .committed = false };
+    errdefer held.release();
+    const seg = held.get().read();
+    var live: Live = .{ .number = number, .docs = b.docs, .held = held, .committed = false };
     errdefer if (live.deleted) |*d| d.deinit(w.gpa);
     for (w.buffered.items) |d| {
         var docs = try seg.docsOf(d.id);
@@ -326,7 +316,7 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
         if (l.deleted_count == l.docs) continue;
         if (!l.committed) {
             try names.append(a, try fileName(a, l.number, .segment, 0));
-            try contents.append(a, l.held.fresh.file.items);
+            try contents.append(a, l.held.get().from.memory.file.items);
         }
         var entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
         if (l.deleted_count > 0) {
@@ -358,7 +348,7 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
     var kept: usize = 0;
     for (w.live.items) |*l| {
         if (l.deleted_count == l.docs) {
-            l.deinit(w.gpa, io);
+            l.deinit(w.gpa);
             continue;
         }
         if (l.changed) l.deletions_generation = generation;
@@ -368,24 +358,32 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
         kept += 1;
     }
     w.live.shrinkRetainingCapacity(kept);
-    // New segments are read from their files from now on.
+    // New segments are read from their files from now on; a snapshot that
+    // holds one in memory keeps it there until it closes.
     for (w.live.items) |*l| {
-        if (l.held != .fresh) continue;
-        const entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
-        const opened = Opened.open(w.gpa, io, dir, w.schema, entry, w.options.max_block) catch {
-            // One that cannot be reopened stays in memory, as committed as
-            // the rest: its bytes are what its files hold.
+        if (l.held.get().from != .memory) continue;
+        // One that cannot be reopened stays in memory, as committed as the
+        // rest: its bytes are what its file holds.
+        const held = w.reopened(io, l) catch {
             w.reopens_failed += 1;
             continue;
         };
-        l.held.fresh.deinit(w.gpa);
-        l.held = .{ .opened = opened };
+        l.held.release();
+        l.held = held;
     }
     w.prune(io) catch {
         // What is left goes at the next commit, or the next writer's open.
         w.prunes_failed += 1;
     };
     return generation;
+}
+
+/// `l`'s segment held from its committed file.
+fn reopened(w: *const Writer, io: Io, l: *const Live) Opened.OpenError!Held.Handle {
+    const entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
+    var opened = try Opened.open(w.gpa, io, w.dir.get(), w.schema, entry, w.options.max_block);
+    errdefer opened.deinit(w.gpa, io);
+    return .create(w.gpa, .{ .gpa = w.gpa, .io = io, .number = l.number, .docs = l.docs, .from = .{ .file = opened } });
 }
 
 fn fileName(a: Allocator, number: u64, kind: files.Kind, generation: u64) Allocator.Error![]const u8 {
@@ -453,7 +451,7 @@ fn prune(w: *Writer, io: Io) PruneError!void {
     // What the kept manifests name: each segment, and its deletions file.
     var named: std.AutoHashMapUnmanaged(files.Named, void) = .empty;
     for (generations.items[0..keep]) |g| {
-        const m = readManifest(a, io, dir, g, w.schema, w.options.term_bytes, null) catch |err| switch (err) {
+        const m = committed.manifest(a, io, dir, g, .{ .fields = w.schema, .term_bytes = w.options.term_bytes }) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
             // A kept manifest that cannot be read keeps everything.

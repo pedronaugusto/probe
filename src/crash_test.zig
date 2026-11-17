@@ -15,6 +15,8 @@ const seam = @import("airlock.testing");
 const airlock = @import("airlock");
 const Seam = seam.Seam;
 const Writer = @import("Writer.zig");
+const Reader = @import("Reader.zig");
+const snapshots = @import("reader_test.zig");
 const Schema = @import("Schema.zig");
 const segment = @import("segment.zig");
 
@@ -28,8 +30,7 @@ const schema = [_]Schema.Field{
     .{ .name = "serial", .kind = .keyword, .stored = true },
 };
 
-/// A document: its id and the serial that tells it apart.
-const Doc = struct { id: u64, serial: u8 };
+const Doc = snapshots.Doc;
 
 /// What the index holds after each commit, sorted: none before the first.
 const commits = [_][]const Doc{
@@ -127,49 +128,29 @@ pub const Operation = struct {
         while (try it.next(hooked)) |entry| {
             if (std.mem.startsWith(u8, entry.name, Writer.temp_prefix)) return error.TempLeft;
         }
-        var w: Writer = try .open(testing.allocator, hooked, dir, &schema, .{});
-        defer w.deinit(hooked);
-        var got: [8]Doc = undefined;
-        const held = try heldBy(&w, hooked, &got);
+        // A snapshot of the newest commit, as a reader opens it.
+        var r = Reader.open(testing.allocator, hooked, dir, &schema, .{}) catch |err| switch (err) {
+            error.NotFound => {
+                if (s.acknowledged > 0) return error.NotACommit;
+                return;
+            },
+            else => return err,
+        };
+        defer r.deinit();
+        var held: std.ArrayList(Doc) = .empty;
+        defer held.deinit(testing.allocator);
+        try snapshots.holds(&r, hooked, testing.allocator, &held);
         // The last commit that returned, or the one under way.
         const last: usize = @min(s.acknowledged + 1, commits.len - 1);
         for (commits[s.acknowledged .. last + 1]) |want| {
-            if (want.len == held.len and for (want, held) |a, b| {
+            if (want.len == held.items.len and for (want, held.items) |a, b| {
                 if (!std.meta.eql(a, b)) break false;
             } else true) return;
         }
-        std.debug.print("acknowledged {d}, held {any}\n", .{ s.acknowledged, held });
+        std.debug.print("acknowledged {d}, held {any}\n", .{ s.acknowledged, held.items });
         return error.NotACommit;
     }
 };
-
-/// What the writer's segments hold, deleted documents left out, sorted.
-fn heldBy(w: *Writer, io: Io, out: []Doc) ![]const Doc {
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(testing.allocator);
-    var n: usize = 0;
-    for (w.live.items) |*l| {
-        const seg = switch (l.held) {
-            .opened => |*o| &o.segment,
-            .fresh => |*f| &f.segment,
-        };
-        for (0..l.docs) |d| {
-            const doc: u32 = @intCast(d);
-            if (l.deleted) |deleted| if (deleted.has(doc)) continue;
-            var values: [1]segment.store.Value = undefined;
-            try seg.storedOf(io, testing.allocator, doc, &buffer, &values);
-            if (n == out.len) return error.TooManyDocuments;
-            out[n] = .{ .id = seg.idOf(doc), .serial = values[0].bytes[0] - '0' };
-            n += 1;
-        }
-    }
-    std.mem.sort(Doc, out[0..n], {}, struct {
-        fn lessThan(_: void, a: Doc, b: Doc) bool {
-            return a.id < b.id or (a.id == b.id and a.serial < b.serial);
-        }
-    }.lessThan);
-    return out[0..n];
-}
 
 fn everyCrashIn(shard: shakedown.EveryCrashOptions.Shard) !void {
     var ctx: Operation = .{};

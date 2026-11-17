@@ -7,6 +7,8 @@
 const std = @import("std");
 const shakedown = @import("shakedown");
 const Writer = @import("Writer.zig");
+const Reader = @import("Reader.zig");
+const snapshots = @import("reader_test.zig");
 const Manifest = @import("Manifest.zig");
 const Schema = @import("Schema.zig");
 const segment = @import("segment.zig");
@@ -22,45 +24,30 @@ const schema = [_]Schema.Field{
 
 const words = [_][]const u8{ "alpha", "beta", "gamma delta", "parseSpan", "x" };
 
-/// A document of the model: its id and the serial that tells it apart.
-const Doc = struct { id: u64, serial: u32 };
+const Doc = snapshots.Doc;
 
-fn lessThan(_: void, a: Doc, b: Doc) bool {
-    return a.id < b.id or (a.id == b.id and a.serial < b.serial);
-}
-
-/// What the writer's segments hold, deleted documents left out, sorted.
-fn held(w: *Writer, out: *std.ArrayList(Doc)) !void {
-    const gpa = testing.allocator;
-    out.clearRetainingCapacity();
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(gpa);
-    for (w.live.items) |*l| {
-        const seg = switch (l.held) {
-            .opened => |*o| &o.segment,
-            .fresh => |*f| &f.segment,
-        };
-        for (0..l.docs) |d| {
-            const doc: u32 = @intCast(d);
-            if (l.deleted) |deleted| if (deleted.has(doc)) continue;
-            var values: [1]segment.store.Value = undefined;
-            try seg.storedOf(io, gpa, doc, &buffer, &values);
-            try out.append(gpa, .{ .id = seg.idOf(doc), .serial = try std.fmt.parseInt(u32, values[0].bytes, 10) });
-        }
-    }
-    std.mem.sort(Doc, out.items, {}, lessThan);
-}
-
+/// The writer's segments hold exactly `model`, read through a snapshot of
+/// them.
 fn expectHolds(w: *Writer, model: []const Doc) !void {
-    const gpa = testing.allocator;
-    var want: std.ArrayList(Doc) = .empty;
-    defer want.deinit(gpa);
-    try want.appendSlice(gpa, model);
-    std.mem.sort(Doc, want.items, {}, lessThan);
-    var got: std.ArrayList(Doc) = .empty;
-    defer got.deinit(gpa);
-    try held(w, &got);
-    try testing.expectEqualSlices(Doc, want.items, got.items);
+    var r = try w.reader();
+    defer r.deinit();
+    try snapshots.expectHolds(&r, model);
+}
+
+/// A snapshot taken during the run, and what it held then.
+const Taken = struct {
+    reader: Reader,
+    docs: []Doc,
+
+    fn deinit(t: *Taken) void {
+        t.reader.deinit();
+        testing.allocator.free(t.docs);
+    }
+};
+
+/// Every snapshot taken still holds what it held when it was taken.
+fn expectUnchanged(taken: []const Taken) !void {
+    for (taken) |*t| try snapshots.expectHolds(&t.reader, t.docs);
 }
 
 /// The directory holds at most `keep` manifests, and no segment file that
@@ -94,7 +81,10 @@ fn expectPruned(dir: std.Io.Dir, keep: u8) !void {
     }
 }
 
-const Op = enum { add, delete, update, refresh, commit, reopen };
+const Op = enum { add, delete, update, refresh, commit, reopen, snapshot, open_reader, reopen_reader };
+
+/// The most snapshots a run keeps open at once.
+const max_taken = 4;
 
 fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     const s = case.source;
@@ -105,11 +95,18 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     const options: Writer.Options = .{ .keep_commits = keep, .buffer_bytes = gen.intRange(s, usize, 20, 400) };
     var w: Writer = try .open(gpa, io, tmp.dir, &schema, options);
     defer w.deinit(io);
-    // The live documents now, and as of the last commit.
+    // The live documents now, and as of the last commit, if any.
     var current: std.ArrayList(Doc) = .empty;
     defer current.deinit(gpa);
     var committed: std.ArrayList(Doc) = .empty;
     defer committed.deinit(gpa);
+    var any_commit = false;
+    // Snapshots taken along the way, oldest first: none may change.
+    var taken: std.ArrayList(Taken) = .empty;
+    defer {
+        for (taken.items) |*t| t.deinit();
+        taken.deinit(gpa);
+    }
     var serial: u32 = 0;
     for (0..gen.intRange(s, usize, 1, 60)) |_| {
         const id = gen.intRange(s, u64, 0, 9);
@@ -138,8 +135,10 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
                 _ = try w.commit(io);
                 committed.clearRetainingCapacity();
                 try committed.appendSlice(gpa, current.items);
+                any_commit = true;
                 try expectHolds(&w, current.items);
                 try expectPruned(tmp.dir, keep);
+                try expectUnchanged(taken.items);
             },
             .reopen => {
                 w.deinit(io);
@@ -147,9 +146,40 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
                 current.clearRetainingCapacity();
                 try current.appendSlice(gpa, committed.items);
                 try expectHolds(&w, committed.items);
+                try expectUnchanged(taken.items);
+            },
+            .snapshot => {
+                try w.refresh(io);
+                try take(&taken, try w.reader(), current.items);
+            },
+            .open_reader, .reopen_reader => |op| {
+                if (!any_commit) {
+                    try testing.expectError(error.NotFound, Reader.open(gpa, io, tmp.dir, &schema, .{}));
+                    continue;
+                }
+                const r = if (op == .reopen_reader and taken.items.len > 0)
+                    try taken.items[taken.items.len - 1].reader.reopen(io)
+                else
+                    try Reader.open(gpa, io, tmp.dir, &schema, .{});
+                try take(&taken, r, committed.items);
             },
         }
     }
+    try expectUnchanged(taken.items);
+}
+
+/// Keeps `r`, which holds `docs`, closing the oldest snapshot past
+/// `max_taken`.
+fn take(taken: *std.ArrayList(Taken), r: Reader, docs: []const Doc) !void {
+    const gpa = testing.allocator;
+    var t: Taken = .{ .reader = r, .docs = try gpa.dupe(Doc, docs) };
+    errdefer t.deinit();
+    try snapshots.expectHolds(&t.reader, t.docs);
+    if (taken.items.len == max_taken) {
+        var oldest = taken.orderedRemove(0);
+        oldest.deinit();
+    }
+    try taken.append(gpa, t);
 }
 
 fn deleteFrom(docs: *std.ArrayList(Doc), id: u64) !void {

@@ -44,6 +44,11 @@ pub const Bitmap = struct {
         return b;
     }
 
+    /// A copy of `b`, that later adds to `b` leave as it is.
+    pub fn clone(b: Bitmap, gpa: Allocator) Allocator.Error!Bitmap {
+        return .{ .docs = b.docs, .words = try gpa.dupe(u64, b.words) };
+    }
+
     pub fn add(b: *Bitmap, doc: u32) void {
         aegis.assert.invariant(doc < b.docs, "a doc id is one of its segment's");
         b.words[doc / 64] |= @as(u64, 1) << @intCast(doc % 64);
