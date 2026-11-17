@@ -36,6 +36,7 @@ const Schema = @import("Schema.zig");
 const Manifest = @import("Manifest.zig");
 const Opened = @import("Opened.zig");
 const Held = @import("Held.zig");
+const merge = @import("merge.zig");
 const Reader = @import("Reader.zig");
 const committed = @import("committed.zig");
 const bitmap = @import("encoding.zig").bitmap;
@@ -67,6 +68,8 @@ pub const Options = struct {
     max_block: u32 = 16 * 1024 * 1024 + segment.store.block_bytes,
     /// Told what differs when the index is `SchemaMismatch`.
     mismatch: ?*Manifest.Mismatch = null,
+    /// Which segments `mergeStep` merges.
+    merge: merge.Policy = .{},
 };
 
 pub const OpenError = error{ Locked, NotFound, Corrupt, VersionTooNew, SchemaMismatch, ReadFailed, WriteFailed, Canceled, OutOfMemory };
@@ -84,6 +87,8 @@ const Live = struct {
     /// changed since.
     deleted: ?bitmap.Bitmap = null,
     deleted_count: u32 = 0,
+    /// Its deleted documents as of the last commit.
+    committed_count: u32 = 0,
     /// Whether its files are committed.
     committed: bool,
     deletions_generation: ?u64 = null,
@@ -178,6 +183,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, o
             if (try committed.deletions(gpa, io, dir, entry)) |deleted| {
                 live.deleted = deleted;
                 live.deleted_count = entry.deletions.?.count;
+                live.committed_count = live.deleted_count;
                 live.deletions_generation = entry.deletions.?.generation;
             }
             w.live.appendAssumeCapacity(live);
@@ -352,6 +358,7 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
             continue;
         }
         if (l.changed) l.deletions_generation = generation;
+        l.committed_count = l.deleted_count;
         l.changed = false;
         l.committed = true;
         w.live.items[kept] = l.*;
@@ -364,7 +371,7 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
         if (l.held.get().from != .memory) continue;
         // One that cannot be reopened stays in memory, as committed as the
         // rest: its bytes are what its file holds.
-        const held = w.reopened(io, l) catch {
+        const held = w.reopened(io, l.number, l.docs) catch {
             w.reopens_failed += 1;
             continue;
         };
@@ -378,12 +385,12 @@ pub fn commit(w: *Writer, io: Io) CommitError!u64 {
     return generation;
 }
 
-/// `l`'s segment held from its committed file.
-fn reopened(w: *const Writer, io: Io, l: *const Live) Opened.OpenError!Held.Handle {
-    const entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
+/// Segment `number`, of `docs` documents, held from its committed file.
+fn reopened(w: *const Writer, io: Io, number: u64, docs: u32) Opened.OpenError!Held.Handle {
+    const entry: Manifest.Segment = .{ .number = number, .docs = docs };
     var opened = try Opened.open(w.gpa, io, w.dir.get(), w.schema, entry, w.options.max_block);
     errdefer opened.deinit(w.gpa, io);
-    return .create(w.gpa, .{ .gpa = w.gpa, .io = io, .number = l.number, .docs = l.docs, .from = .{ .file = opened } });
+    return .create(w.gpa, .{ .gpa = w.gpa, .io = io, .number = number, .docs = docs, .from = .{ .file = opened } });
 }
 
 fn fileName(a: Allocator, number: u64, kind: files.Kind, generation: u64) Allocator.Error![]const u8 {
@@ -421,14 +428,146 @@ fn publish(a: Allocator, io: Io, dir: Io.Dir, names: []const []const u8, content
             else => return error.WriteFailed,
         };
     }
-    const slots = try a.alloc(airlock.Batch.Slot, names.len + 1);
+    try commitPendings(a, io, pendings, level);
+}
+
+/// Commits `pendings` in one batch, the last after a fence: every file
+/// before it reaches the disk first.
+fn commitPendings(a: Allocator, io: Io, pendings: []airlock.Pending, level: airlock.Level) (Allocator.Error || airlock.Batch.Error)!void {
+    const slots = try a.alloc(airlock.Batch.Slot, pendings.len + 1);
     var batch: airlock.Batch = .init(slots);
-    for (pendings[0 .. names.len - 1]) |*p| batch.addPending(io, p, .create_new);
+    for (pendings[0 .. pendings.len - 1]) |*p| batch.addPending(io, p, .create_new);
     batch.fence();
-    batch.addPending(io, &pendings[names.len - 1], .create_new);
+    batch.addPending(io, &pendings[pendings.len - 1], .create_new);
     _ = batch.commit(io, .{ .level = level }) catch |err| {
         batch.reset(io);
         return err;
+    };
+}
+
+pub const MergeError = error{ Corrupt, ReadFailed, WriteFailed, Canceled, OutOfMemory } || airlock.Batch.Error;
+
+/// A merge done: the commit that holds it, the segment it wrote, how many
+/// segments it took the place of, and its documents.
+pub const MergeReport = struct {
+    generation: u64,
+    segment: u64,
+    sources: u32,
+    docs: u32,
+};
+
+/// One merge, if the policy (`Options.merge`) finds one due among the
+/// committed segments read from their files whose deletions are committed:
+/// their live documents written as one new segment, then committed with a
+/// manifest that names it in their place and the rest of the last commit as
+/// it was, in one batch, the segment before a fence. What the writer holds
+/// and has not committed stays for the next commit. A merge that fails
+/// leaves the index as it was; a source whose bytes are not what its table
+/// says is `Corrupt`, `diagnostic` told which.
+pub fn mergeStep(w: *Writer, io: Io, diagnostic: ?*merge.Diagnostic) MergeError!?MergeReport {
+    var arena: std.heap.ArenaAllocator = .init(w.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var places: std.ArrayList(usize) = .empty;
+    var sizes: std.ArrayList(merge.Policy.Size) = .empty;
+    for (w.live.items, 0..) |*l, i| {
+        if (!l.committed or l.changed or l.held.get().from != .file or l.deleted_count == l.docs) continue;
+        try places.append(a, i);
+        try sizes.append(a, .{ .live = l.docs - l.deleted_count, .docs = l.docs });
+    }
+    const chosen = w.options.merge.choose(sizes.items, try a.alloc(usize, sizes.items.len));
+    if (chosen.len == 0) return null;
+    // The live segments the merge takes the place of.
+    const taken = try a.alloc(bool, w.live.items.len);
+    @memset(taken, false);
+    const inputs = try a.alloc(merge.Input, chosen.len);
+    for (chosen, inputs) |c, *in| {
+        taken[places.items[c]] = true;
+        const l = &w.live.items[places.items[c]];
+        in.* = .{ .number = l.number, .segment = l.segmentOf(), .deleted = if (l.deleted) |*d| d else null, .table = l.held.get().from.file.table };
+    }
+    const number = w.next_segment;
+    const generation = w.generation + 1;
+    const dir = w.dir.get();
+
+    var pendings: [2]airlock.Pending = undefined;
+    var made: usize = 0;
+    // Discarded whatever happened: before its publish a pending removes its
+    // temp, after it only closes what it still holds.
+    defer for (pendings[0..made]) |*p| p.discard(io);
+    pendings[0] = airlock.create(io, dir, try fileName(a, number, .segment, 0), .{ .temp = .{ .random = temp_prefix } }) catch |err| return created(err);
+    made += 1;
+    var file_writer = pendings[0].file().writer(io, try a.alloc(u8, 64 * 1024));
+    const docs = merge.merge(w.gpa, io, w.schema, w.options.term_bytes, inputs, &file_writer.interface, number, diagnostic) catch |err| return switch (err) {
+        error.WriteFailed => if (file_writer.err) |e| switch (e) {
+            error.Canceled => error.Canceled,
+            else => error.WriteFailed,
+        } else error.WriteFailed,
+        else => |e| e,
+    };
+
+    // The last commit as it was, the sources out and the merged segment in.
+    var entries: std.ArrayList(Manifest.Segment) = .empty;
+    for (w.live.items, taken) |*l, gone| {
+        if (!l.committed or gone) continue;
+        var entry: Manifest.Segment = .{ .number = l.number, .docs = l.docs };
+        if (l.committed_count > 0) entry.deletions = .{ .generation = l.deletions_generation.?, .count = l.committed_count };
+        try entries.append(a, entry);
+    }
+    if (docs > 0) try entries.append(a, .{ .number = number, .docs = docs });
+    const manifest: Manifest = .{
+        .generation = generation,
+        .next_segment = number + 1,
+        .term_bytes = w.options.term_bytes,
+        .fields = w.schema,
+        .segments = entries.items,
+    };
+    var manifest_bytes: std.Io.Writer.Allocating = .init(a);
+    manifest.write(&manifest_bytes.writer) catch return error.OutOfMemory;
+    var manifest_name: [Manifest.name_bytes]u8 = undefined;
+    pendings[1] = airlock.create(io, dir, Manifest.name(&manifest_name, generation), .{ .temp = .{ .random = temp_prefix } }) catch |err| return created(err);
+    made += 1;
+    pendings[1].file().writePositionalAll(io, manifest_bytes.written(), 0) catch |err| return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.WriteFailed,
+    };
+    // Room for the merged segment, so nothing fails once it is committed.
+    try w.live.ensureUnusedCapacity(w.gpa, 1);
+    // A merge of documents all deleted writes no segment: its file is left
+    // to the pending's discard.
+    try commitPendings(a, io, if (docs > 0) pendings[0..2] else pendings[1..2], w.options.durability);
+
+    // Committed: the writer's state says so before anything can fail.
+    w.generation = generation;
+    w.next_segment = number + 1;
+    const merged: ?Held.Handle = if (docs == 0) null else w.reopened(io, number, docs) catch blk: {
+        // The sources stay, holding the same documents: the next commit
+        // names them again, and the merged file goes with the next prune.
+        w.reopens_failed += 1;
+        break :blk null;
+    };
+    if (docs > 0 and merged == null) return .{ .generation = generation, .segment = number, .sources = @intCast(chosen.len), .docs = docs };
+    var kept: usize = 0;
+    for (w.live.items, taken) |*l, gone| {
+        if (gone) {
+            l.deinit(w.gpa);
+            continue;
+        }
+        w.live.items[kept] = l.*;
+        kept += 1;
+    }
+    w.live.shrinkRetainingCapacity(kept);
+    if (merged) |held| w.live.appendAssumeCapacity(.{ .number = number, .docs = docs, .held = held, .committed = true });
+    w.prune(io) catch {
+        w.prunes_failed += 1;
+    };
+    return .{ .generation = generation, .segment = number, .sources = @intCast(chosen.len), .docs = docs };
+}
+
+fn created(err: airlock.CreateError) MergeError {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.WriteFailed,
     };
 }
 

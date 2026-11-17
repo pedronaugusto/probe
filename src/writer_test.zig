@@ -81,7 +81,7 @@ fn expectPruned(dir: std.Io.Dir, keep: u8) !void {
     }
 }
 
-const Op = enum { add, delete, update, refresh, commit, reopen, snapshot, open_reader, reopen_reader };
+const Op = enum { add, delete, update, refresh, commit, reopen, snapshot, open_reader, reopen_reader, merge };
 
 /// The most snapshots a run keeps open at once.
 const max_taken = 4;
@@ -92,7 +92,11 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const keep = gen.intRange(s, u8, 1, 3);
-    const options: Writer.Options = .{ .keep_commits = keep, .buffer_bytes = gen.intRange(s, usize, 20, 400) };
+    const options: Writer.Options = .{
+        .keep_commits = keep,
+        .buffer_bytes = gen.intRange(s, usize, 20, 400),
+        .merge = .{ .per_tier = gen.intRange(s, u8, 2, 3), .floor_docs = 1, .deleted_percent = 30 },
+    };
     var w: Writer = try .open(gpa, io, tmp.dir, &schema, options);
     defer w.deinit(io);
     // The live documents now, and as of the last commit, if any.
@@ -151,6 +155,15 @@ fn againstModel(_: void, case: *shakedown.Case) anyerror!void {
             .snapshot => {
                 try w.refresh(io);
                 try take(&taken, try w.reader(), current.items);
+            },
+            .merge => {
+                // A merge commits the last commit's documents again, in
+                // fewer segments; what is not committed stays.
+                _ = try w.mergeStep(io, null);
+                try w.refresh(io);
+                try expectHolds(&w, current.items);
+                try expectPruned(tmp.dir, keep);
+                try expectUnchanged(taken.items);
             },
             .open_reader, .reopen_reader => |op| {
                 if (!any_commit) {

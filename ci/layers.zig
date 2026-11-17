@@ -16,6 +16,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "index segment", .patterns = &.{ "src/Opened.zig", "src/committed.zig" } },
     .{ .name = "index held", .patterns = &.{"src/Held.zig"} },
     .{ .name = "index reader", .patterns = &.{"src/Reader.zig"} },
+    .{ .name = "index merge", .patterns = &.{"src/merge.zig"} },
     .{ .name = "index", .patterns = &.{"src/Writer.zig"} },
     .{ .name = "public", .patterns = &.{"src/probe.zig"} },
 };
@@ -65,6 +66,7 @@ pub const required = [_][]const u8{
     "src/committed.zig",
     "src/Held.zig",
     "src/Reader.zig",
+    "src/merge.zig",
     "src/Writer.zig",
     "src/probe.zig",
 };

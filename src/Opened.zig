@@ -36,6 +36,9 @@ fn closeFile(f: *Io.File, io: Io) void {
 const whole_sections = [_]files.Section{ .terms, .lengths, .ids, .columns };
 
 file: File,
+/// Its table: each section's place and CRC-32C, which a merge checks its
+/// reads against.
+table: files.Table,
 /// Each whole section's bytes.
 whole: [whole_sections.len][]u8,
 segment: layer.read.Segment,
@@ -51,6 +54,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, schema: []const Schema.Field, e
     errdefer o.file.deinit(io);
     const expected: files.Expected = .{ .kind = .segment, .segment = entry.number };
     const table = try expected.openSegment(io, file);
+    o.table = table;
     const len = file.length(io) catch |err| return switch (err) {
         error.Canceled => error.Canceled,
         else => error.ReadFailed,

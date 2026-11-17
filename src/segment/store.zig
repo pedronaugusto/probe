@@ -205,6 +205,36 @@ pub const Store = struct {
         };
     }
 
+    /// A block decoded: the documents it holds, from `first` to before
+    /// `end`.
+    pub const Block = struct { first: u32, end: u32 };
+
+    /// Block `block` read on `io` into `compressed` as it is in the store,
+    /// and decoded into `raw`, for reading a store in order (a merge). Its
+    /// documents' values are read from `raw` by `values`, in turn.
+    pub fn readBlock(s: Store, io: Io, gpa: Allocator, b: u32, compressed: *std.ArrayList(u8), raw: *std.ArrayList(u8)) (Error || Allocator.Error)!Block {
+        aegis.assert.invariant(b < s.blocks, "a block of the store");
+        const e = s.entry(b);
+        try compressed.resize(gpa, e.len);
+        try s.source.read(io, e.start, compressed.items);
+        try raw.resize(gpa, e.raw);
+        errdefer raw.clearRetainingCapacity();
+        const decoded = warp.lz4.decompressBlock(compressed.items, raw.items, .{}) catch return error.Corrupt;
+        if (decoded.out_len != e.raw) return error.Corrupt;
+        return .{ .first = e.first, .end = if (b + 1 < s.blocks) s.entry(b + 1).first else s.docs };
+    }
+
+    /// The next document's values in a decoded block `raw`, from `at`, one
+    /// per stored field, into `out`.
+    pub fn values(s: Store, raw: []const u8, at: *usize, out: []Value) Error!void {
+        var slot: usize = 0;
+        for (s.fields) |f| {
+            if (!f.stored) continue;
+            out[slot] = try readValue(raw, at, f.kind);
+            slot += 1;
+        }
+    }
+
     /// `doc`'s stored values, one per stored field, in `out`, its block read
     /// on `io`; the bytes ones point into `buffer`, which holds the decoded
     /// block afterwards.

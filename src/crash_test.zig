@@ -1,7 +1,8 @@
-//! Every crash of a writer's commits, inside a shakedown `Sim`: airlock's
-//! syncs and renames routed onto its simulated disk, a power loss at every
-//! step of a run of three commits, and every state the disk could come back
-//! in. After each, a writer opens the index as a program restarting would,
+//! Every crash of a writer's commits and merges, inside a shakedown `Sim`:
+//! airlock's syncs and renames routed onto its simulated disk, a power loss
+//! at every step of a run of three commits, or of two commits and a merge,
+//! and every state the disk could come back in. After each, a writer opens
+//! the index as a program restarting would,
 //! removing what the crash left, and the index is checked for what a
 //! commit promises: it holds exactly the documents of one commit, no older
 //! than the last that returned and no newer than the one under way, and no
@@ -40,6 +41,10 @@ const commits = [_][]const Doc{
     &.{ .{ .id = 1, .serial = 4 }, .{ .id = 3, .serial = 2 }, .{ .id = 4, .serial = 3 }, .{ .id = 5, .serial = 5 } },
 };
 
+/// What the index holds after each commit when the third is the merge's:
+/// the second's documents, in one segment.
+const merged = [_][]const Doc{ commits[0], commits[1], commits[2], commits[2] };
+
 /// The index's directory, made durably: its name synced into its parent, as
 /// a program gives the writer a directory a crash cannot lose.
 fn makeDir(io: Io) !Io.Dir {
@@ -70,6 +75,9 @@ pub const Operation = struct {
     arena: std.heap.ArenaAllocator = .init(testing.allocator),
     /// The commits that returned before the crash.
     acknowledged: usize = 0,
+    /// Whether the third step is a merge of the first two commits'
+    /// segments, not a commit.
+    merge: bool = false,
 
     pub fn setUp(s: *Operation, sim: *shakedown.Sim) !void {
         s.h = try Seam.create(testing.allocator, sim.io(), .{ .trace = .off });
@@ -88,7 +96,7 @@ pub const Operation = struct {
         const io = s.h.?.io();
         const dir = try makeDir(io);
         defer dir.close(io);
-        var w: Writer = try .open(s.arena.allocator(), io, dir, &schema, .{});
+        var w: Writer = try .open(s.arena.allocator(), io, dir, &schema, .{ .merge = .{ .per_tier = 2, .floor_docs = 10 } });
         defer w.deinit(io);
         for ([_]u64{ 1, 2, 3 }, 0..) |id, serial| try add(&w, io, id, @intCast(serial), false);
         _ = try w.commit(io);
@@ -97,9 +105,13 @@ pub const Operation = struct {
         try w.delete(2);
         _ = try w.commit(io);
         s.acknowledged = 2;
-        try add(&w, io, 1, 4, true);
-        try add(&w, io, 5, 5, false);
-        _ = try w.commit(io);
+        if (s.merge) {
+            if (try w.mergeStep(io, null) == null) return error.NoMerge;
+        } else {
+            try add(&w, io, 1, 4, true);
+            try add(&w, io, 5, 5, false);
+            _ = try w.commit(io);
+        }
         s.acknowledged = 3;
     }
 
@@ -142,7 +154,8 @@ pub const Operation = struct {
         try snapshots.holds(&r, hooked, testing.allocator, &held);
         // The last commit that returned, or the one under way.
         const last: usize = @min(s.acknowledged + 1, commits.len - 1);
-        for (commits[s.acknowledged .. last + 1]) |want| {
+        const held_by = if (s.merge) &merged else &commits;
+        for (held_by[s.acknowledged .. last + 1]) |want| {
             if (want.len == held.items.len and for (want, held.items) |a, b| {
                 if (!std.meta.eql(a, b)) break false;
             } else true) return;
@@ -152,8 +165,8 @@ pub const Operation = struct {
     }
 };
 
-fn everyCrashIn(shard: shakedown.EveryCrashOptions.Shard) !void {
-    var ctx: Operation = .{};
+fn everyCrashIn(shard: shakedown.EveryCrashOptions.Shard, merge: bool) !void {
+    var ctx: Operation = .{ .merge = merge };
     var report: shakedown.EveryFaultReport = .{};
     defer report.deinit();
     const result = shakedown.everyCrash(testing.allocator, &ctx, .{
@@ -175,23 +188,42 @@ fn everyCrashIn(shard: shakedown.EveryCrashOptions.Shard) !void {
 }
 
 // The sweep, measured on macOS (Darwin's sync model): the clean run is 300
-// steps; at its crash points the disk can come back in 182 states, each
-// recovered and checked, and 15,008 more images that repeat one of them,
+// steps; at its crash points the disk can come back in 240 states, each
+// recovered and checked, and 14,959 more images that repeat one of them,
 // none past the 512-state bound. In four ranges each stays well inside the
 // runner's watchdog under emulation; a state two ranges reach is recovered
 // in each.
 test "every crash: three commits, points 1 of 4" {
-    try everyCrashIn(.{ .index = 0, .count = 4 });
+    try everyCrashIn(.{ .index = 0, .count = 4 }, false);
 }
 
 test "every crash: three commits, points 2 of 4" {
-    try everyCrashIn(.{ .index = 1, .count = 4 });
+    try everyCrashIn(.{ .index = 1, .count = 4 }, false);
 }
 
 test "every crash: three commits, points 3 of 4" {
-    try everyCrashIn(.{ .index = 2, .count = 4 });
+    try everyCrashIn(.{ .index = 2, .count = 4 }, false);
 }
 
 test "every crash: three commits, points 4 of 4" {
-    try everyCrashIn(.{ .index = 3, .count = 4 });
+    try everyCrashIn(.{ .index = 3, .count = 4 }, false);
+}
+
+// The merge's sweep, measured the same way: two commits, then a merge of
+// their two segments, 292 steps; 200 states recovered and checked, 9,908
+// images repeating one of them, none past the bound.
+test "every crash: two commits and a merge, points 1 of 4" {
+    try everyCrashIn(.{ .index = 0, .count = 4 }, true);
+}
+
+test "every crash: two commits and a merge, points 2 of 4" {
+    try everyCrashIn(.{ .index = 1, .count = 4 }, true);
+}
+
+test "every crash: two commits and a merge, points 3 of 4" {
+    try everyCrashIn(.{ .index = 2, .count = 4 }, true);
+}
+
+test "every crash: two commits and a merge, points 4 of 4" {
+    try everyCrashIn(.{ .index = 3, .count = 4 }, true);
 }
