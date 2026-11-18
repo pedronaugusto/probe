@@ -11,9 +11,7 @@ const query = @import("query.zig");
 
 /// The index of a document type: `Index(Doc).openWriter`, `.openReader`,
 /// `.Query`.
-pub fn Index(comptime Doc: type) type {
-    return index.Index(Doc);
-}
+pub const Index = index.Index;
 
 /// Why an index did not open, and on which file.
 pub const OpenDiagnostic = index.OpenDiagnostic;
