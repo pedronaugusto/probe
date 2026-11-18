@@ -7,9 +7,10 @@
 //! commit promises: it holds exactly the documents of one commit, no older
 //! than the last that returned and no newer than the one under way, every
 //! file it names verifies by its checksums, and no temporary file is left.
-//! Then every single fault at every call of a commit and a merge on a real
-//! directory (shakedown's `everyFault`: an error from any call, a short
-//! write, a cancel), each checked the same way once a writer reopens it.
+//! Then every single fault at every call of a commit and a merge, each run
+//! on a fresh `Sim` of one seed (shakedown's `everyFault`: an error from any
+//! call, a short write, a cancel), each checked the same way once a writer
+//! reopens it.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -274,39 +275,69 @@ fn faultClasses(call: seam.Call) []const shakedown.IoFault {
 }
 
 /// Every single fault at every step of a second commit and a merge, on a
-/// real directory holding a first commit: an error from any call, a short
-/// write, a cancel. Whatever failed, a writer opens
+/// simulated disk holding a first commit: an error from any call, a short
+/// write, a cancel. Every run is a fresh `Sim` of the same seed, so airlock's
+/// concurrent syncs run in one order every run. Whatever failed, a writer opens
 /// the index afterwards as a program restarting would, and the index holds
 /// exactly the documents of one commit, no older than the last that
 /// returned and no newer than the one under way, every file it names
 /// verifies, and no temporary file is left.
 pub const Faulted = struct {
-    tmp: testing.TmpDir = undefined,
+    /// The disk holding the first commit, which each run starts from.
+    first: shakedown.Sim.Fs.Snapshot,
     h: *Seam = undefined,
     acknowledged: usize = 0,
 
-    pub fn setUp(s: *Faulted, fio: *shakedown.FaultIo) !void {
-        s.tmp = testing.tmpDir(.{ .iterate = true });
-        errdefer s.tmp.cleanup();
-        {
-            var w: Writer = try .open(testing.allocator, testing.io, s.tmp.dir, &schema, merge_options);
-            defer w.deinit(testing.io);
-            for ([_]u64{ 1, 2, 3 }, 0..) |id, serial| try add(&w, testing.io, id, @intCast(serial), false);
-            _ = try w.commit(testing.io);
+    /// A simulation that makes the first commit, and the disk it leaves.
+    const First = struct {
+        sim: *shakedown.Sim,
+        disk: shakedown.Sim.Fs.Snapshot,
+
+        fn make() !First {
+            const sim = try shakedown.Sim.init(testing.allocator, sim_options);
+            errdefer sim.deinit();
+            const Commit = struct {
+                fn run(io: Io) !void {
+                    const h = try Seam.create(testing.allocator, io, .{ .trace = .off });
+                    defer h.destroy();
+                    const dir = try makeDir(h.io());
+                    defer dir.close(h.io());
+                    var w: Writer = try .open(testing.allocator, h.io(), dir, &schema, merge_options);
+                    defer w.deinit(h.io());
+                    for ([_]u64{ 1, 2, 3 }, 0..) |id, serial| try add(&w, h.io(), id, @intCast(serial), false);
+                    _ = try w.commit(h.io());
+                }
+            };
+            switch (sim.run(Commit.run, .{sim.io()})) {
+                .finished => {},
+                .failed => |err| return err,
+                else => return error.FirstCommit,
+            }
+            return .{ .sim = sim, .disk = try sim.fs().snapshot() };
         }
+
+        fn deinit(f: First) void {
+            f.disk.deinit();
+            f.sim.deinit();
+        }
+    };
+
+    pub fn setUp(s: *Faulted, fio: *shakedown.FaultIo) !void {
+        shakedown.Sim.fsOf(fio.io()).?.restore(s.first);
         s.h = try Seam.over(testing.allocator, fio, .{});
         s.acknowledged = 1;
     }
 
     pub fn tearDown(s: *Faulted) void {
         s.h.destroy();
-        s.tmp.cleanup();
     }
 
     pub fn run(s: *Faulted, base: Io) !void {
         _ = base;
         const io = s.h.io();
-        var w: Writer = try .open(testing.allocator, io, s.tmp.dir, &schema, merge_options);
+        const dir = try Io.Dir.cwd().openDir(io, "index", .{ .iterate = true });
+        defer dir.close(io);
+        var w: Writer = try .open(testing.allocator, io, dir, &schema, merge_options);
         defer w.deinit(io);
         try add(&w, io, 4, 3, false);
         try w.delete(2);
@@ -322,35 +353,40 @@ pub const Faulted = struct {
         return faultClasses(@fromBackingInt(@as(u8, @intCast(f.call))));
     }
 
-    pub fn check(s: *Faulted, base: Io, result: anyerror!void, injected: ?shakedown.Injected) !void {
-        _ = base;
+    /// Judged on the simulation's `Io` past the faults, through a seam of
+    /// its own, as a program restarting would open the index.
+    pub fn check(s: *Faulted, judged: Io, result: anyerror!void, injected: ?shakedown.Injected) !void {
         _ = injected;
         if (result) |_| {
             if (s.acknowledged != 3) return error.NotACommit;
         } else |_| {}
-        const dir = s.tmp.dir;
+        const h = try Seam.create(testing.allocator, judged, .{ .trace = .off });
+        defer h.destroy();
+        const io = h.io();
+        const dir = try Io.Dir.cwd().openDir(io, "index", .{ .iterate = true });
+        defer dir.close(io);
         {
-            var w: Writer = try .open(testing.allocator, testing.io, dir, &schema, merge_options);
-            w.deinit(testing.io);
+            var w: Writer = try .open(testing.allocator, io, dir, &schema, merge_options);
+            w.deinit(io);
         }
         var it = dir.iterate();
-        while (try it.next(testing.io)) |entry| {
+        while (try it.next(io)) |entry| {
             if (std.mem.startsWith(u8, entry.name, Writer.temp_prefix)) return error.TempLeft;
         }
-        var r = try Reader.open(testing.allocator, testing.io, dir, &schema, .{});
+        var r = try Reader.open(testing.allocator, io, dir, &schema, .{});
         defer r.deinit();
         var buffer: [4096]u8 = undefined;
         for (r.segments) |*seg| {
-            try verifyFile(testing.io, dir, .{ .kind = .segment, .segment = seg.number() }, 0, &buffer);
+            try verifyFile(io, dir, .{ .kind = .segment, .segment = seg.number() }, 0, &buffer);
             switch (seg.deletions) {
-                .committed => |generation| try verifyFile(testing.io, dir, .{ .kind = .deletions, .segment = seg.number() }, generation, &buffer),
+                .committed => |generation| try verifyFile(io, dir, .{ .kind = .deletions, .segment = seg.number() }, generation, &buffer),
                 .none => {},
                 .unsaved => return error.NotACommit,
             }
         }
         var held: std.ArrayList(Doc) = .empty;
         defer held.deinit(testing.allocator);
-        try snapshots.holds(&r, testing.io, testing.allocator, &held);
+        try snapshots.holds(&r, io, testing.allocator, &held);
         const last: usize = @min(s.acknowledged + 1, merged.len - 1);
         for (merged[s.acknowledged .. last + 1]) |want| {
             if (want.len == held.items.len and for (want, held.items) |a, b| {
@@ -362,21 +398,24 @@ pub const Faulted = struct {
     }
 };
 
+/// The simulation every run of the fault sweep is made on, and its first
+/// commit's.
+const sim_options: shakedown.Sim.Options = .{ .fs = .{ .names = names }, .watchdog = null };
+
 fn everyFaultIn(shard: @FieldType(shakedown.EveryFaultOptions, "shard")) !void {
-    var ctx: Faulted = .{};
+    const first: Faulted.First = try .make();
+    defer first.deinit();
+    var ctx: Faulted = .{ .first = first.disk };
     var report: shakedown.EveryFaultReport = .{};
     defer report.deinit();
-    // No task runs concurrently: airlock then syncs a batch's files one
-    // after another, so every run makes its calls in one order.
-    var serial: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
-    defer serial.deinit();
-    const result = shakedown.everyFault(testing.allocator, serial.io(), &ctx, .{
+    const result = shakedown.everyFault(testing.allocator, testing.io, &ctx, .{
         .errors = &.{ error.InputOutput, error.NoSpaceLeft },
         // Whether a remap moves the block is the allocator's, so a run that
         // refuses one is not held to the clean run's calls.
         .alloc = false,
         .diagnostics = &report,
         .shard = shard,
+        .sim = sim_options,
     });
     const done = result catch |err| {
         if (report.failure) |f| std.debug.print("every fault: {t} at {any} difference {any}\n{s}\n", .{ f.err, f.injected, f.difference, f.trace });
@@ -385,8 +424,9 @@ fn everyFaultIn(shard: @FieldType(shakedown.EveryFaultOptions, "shard")) !void {
     try testing.expect(done.runs > 1);
 }
 
-// Measured on macOS: the clean run is 217 steps and the sweep 412 runs,
-// under half a minute in Debug.
+// Measured on macOS: the clean run is 243 steps and the sweep 415 runs,
+// 40 of whose calls (airlock's syncs, run concurrently) were still waiting
+// when their run's fault fired; well under half a minute in Debug.
 test "every fault: a commit and a merge, any call failing, leave one commit whole" {
     try everyFaultIn(.{});
 }
