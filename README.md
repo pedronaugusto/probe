@@ -8,8 +8,9 @@ last commit readable.
 
 ## Status
 
-In development, and not yet released. A document type declares how its fields are indexed,
-and `Index(Doc)` writes, commits, merges and searches it:
+In development, and not yet released. [The design](docs/design.md) says how it is built. A
+document type declares how its fields are indexed, and `Index(Doc)` writes, commits, merges
+and searches it:
 
 <!-- BEGIN GENERATED zig build docs -- usage -->
 ```zig
