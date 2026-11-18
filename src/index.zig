@@ -452,6 +452,15 @@ pub fn Index(comptime Doc: type) type {
                     return b.clauseOf(try query.parse.wordClause(b.arena.allocator(), fields, b.limits, placeOf(field), text, true));
                 }
 
+                /// The documents holding a term of `field` that `pattern`
+                /// matches whole, as `/pattern/` reads: folded and
+                /// case-insensitive on a text field, bytes as they are on a
+                /// keyword field. `error.Invalid` where it does not compile.
+                pub fn regex(b: *Builder, comptime field: Field, pattern: []const u8) QueryParseError!Clause {
+                    comptime notNumeric(field);
+                    return b.clauseOf(try query.parse.patternClause(b.arena.allocator(), fields, b.limits, placeOf(field), pattern));
+                }
+
                 /// The documents whose `field` lies from `min` to `max`,
                 /// both included; null for no bound.
                 pub fn range(b: *Builder, comptime field: Field, min: ?@FieldType(Doc, @tagName(field)), max: ?@FieldType(Doc, @tagName(field))) Clause {

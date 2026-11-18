@@ -2,7 +2,7 @@ const std = @import("std");
 const airlock_build = @import("airlock");
 
 /// What a project that depends on probe builds: the `probe` module, on
-/// aegis, xenoglyph, warp, strand and airlock. The tests, checks and gate are `dev`'s.
+/// aegis, xenoglyph, warp, strand, airlock and spectra. The tests, checks and gate are `dev`'s.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -10,9 +10,9 @@ pub fn build(b: *std.Build) void {
     addSourceImports(b, module, target, optimize);
 }
 
-/// What probe's sources import: aegis, xenoglyph, warp, strand and airlock.
+/// What probe's sources import: aegis, xenoglyph, warp, strand, airlock and spectra.
 fn addSourceImports(p: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
-    inline for (.{ "aegis", "xenoglyph", "warp", "strand", "airlock" }) |name| {
+    inline for (.{ "aegis", "xenoglyph", "warp", "strand", "airlock", "spectra" }) |name| {
         module.addImport(name, p.dependency(name, .{ .target = target, .optimize = optimize }).module(name));
     }
 }
@@ -64,6 +64,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     tools.preflight.addConsumerCheck(b, p, .{
         .package = "probe",
         .program = p.path("ci/consumer.zig"),
-        .packages = &.{ p.dependency("aegis", .{}), p.dependency("xenoglyph", .{}), p.dependency("warp", .{}), p.dependency("strand", .{}), p.dependency("airlock", .{}) },
+        .packages = &.{ p.dependency("aegis", .{}), p.dependency("xenoglyph", .{}), p.dependency("warp", .{}), p.dependency("strand", .{}), p.dependency("airlock", .{}), p.dependency("spectra", .{}) },
     });
 }

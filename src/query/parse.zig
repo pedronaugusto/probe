@@ -18,6 +18,12 @@
 //!   quoted bytes are one term.
 //! - `word*` is a prefix: on a text field one word, case-folded; on a
 //!   keyword field the bytes as they are.
+//! - `/pattern/` is a regex term query (Lucene's): the documents holding a
+//!   term the pattern matches whole, in spectra's syntax (Rust regex's).
+//!   On a text field the pattern's literals fold as the field folds its
+//!   terms and it matches case-insensitive; on a keyword field it reads the
+//!   bytes as they are. `\/` is a slash in it. A pattern that does not
+//!   compile is `invalid_pattern`.
 //! - `field:[a TO b]` is a numeric range, both bounds included, either `*`
 //!   for no bound; `field:5` the one value. A number is an integer, negative
 //!   only on a signed field.
@@ -39,6 +45,7 @@ const Schema = @import("../Schema.zig");
 const Limits = @import("../Limits.zig");
 const Pipeline = @import("../analysis/Pipeline.zig");
 const words = @import("../analysis/words.zig");
+const pattern = @import("pattern.zig");
 
 const Allocator = std.mem.Allocator;
 const Node = Tree.Node;
@@ -62,6 +69,9 @@ pub const Problem = enum {
     bad_number,
     /// A prefix of more than one word on a text field.
     prefix_words,
+    /// A `/pattern/` that is not closed, does not compile, or holds a
+    /// lookaround the engine could not run on the longest term.
+    invalid_pattern,
     too_many_clauses,
     too_deep,
 };
@@ -273,6 +283,7 @@ const Parser = struct {
         switch (p.text[p.at]) {
             '(' => return p.group(),
             '"' => return p.phraseIn(p.scope),
+            '/' => return p.patternIn(p.scope),
             ')', '^', '~', ':' => return p.fail(p.at, .unexpected, error.Invalid),
             else => {},
         }
@@ -298,6 +309,7 @@ const Parser = struct {
                 '(' => p.group(),
                 '"' => p.phraseIn(place),
                 '[' => p.range(place),
+                '/' => p.patternIn(place),
                 else => v: {
                     const at = p.at;
                     const value = try p.word(false);
@@ -474,6 +486,48 @@ const Parser = struct {
         };
     }
 
+    /// `/pattern/`, a regex term query in the field at `scope` or in each
+    /// default field that holds terms; `\/` is a slash in the pattern.
+    fn patternIn(p: *Parser, scope: ?u32) Error!?Node {
+        const open = p.at;
+        p.at += 1;
+        var out: std.ArrayList(u8) = .empty;
+        while (true) {
+            if (p.at == p.text.len) return p.fail(open, .invalid_pattern, error.Invalid);
+            const c = p.text[p.at];
+            if (c == '/') break;
+            if (c == '\\' and p.at + 1 < p.text.len) {
+                // The delimiter's escape is the query's; every other is the pattern's.
+                if (p.text[p.at + 1] != '/') try out.append(p.arena, c);
+                try out.append(p.arena, p.text[p.at + 1]);
+                p.at += 2;
+                continue;
+            }
+            try out.append(p.arena, c);
+            p.at += 1;
+        }
+        p.at += 1;
+        if (scope) |place| return p.patternOf(place, out.items, open);
+        var children: std.ArrayList(Node) = .empty;
+        for (p.defaults) |place| {
+            if (p.schema[place].kind == .numeric) continue;
+            if (try p.patternOf(place, out.items, open)) |n| try children.append(p.arena, n);
+        }
+        return p.joined(.@"or", children.items);
+    }
+
+    /// `pattern`'s regex term query in the field at `place`.
+    fn patternOf(p: *Parser, place: u32, text: []const u8, at: usize) Error!?Node {
+        const kind = p.schema[place].kind;
+        if (kind == .numeric) return p.fail(at, .wrong_kind, error.Invalid);
+        const fold = kind == .text;
+        const source = pattern.prepare(p.arena, text, fold, p.term.len) catch |err| switch (err) {
+            error.Invalid => return p.fail(at, .invalid_pattern, error.Invalid),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return try p.node(.{ .regex = .{ .field = place, .pattern = source, .fold = fold } });
+    }
+
     /// `[a TO b]` in the numeric field at `place`.
     fn range(p: *Parser, place: u32) Error!?Node {
         const open = p.at;
@@ -522,6 +576,12 @@ const Parser = struct {
 pub fn wordClause(arena: Allocator, schema: []const Schema.Field, limits: Limits, place: u32, text: []const u8, prefix: bool) Error!?Node {
     var p = try builder(arena, schema, limits);
     return p.valueIn(place, .{ .bytes = text, .prefix = prefix, .escaped = false }, 0);
+}
+
+/// What `parse` builds for `/pattern/` in the field at `place`.
+pub fn patternClause(arena: Allocator, schema: []const Schema.Field, limits: Limits, place: u32, text: []const u8) Error!?Node {
+    var p = try builder(arena, schema, limits);
+    return p.patternOf(place, text, 0);
 }
 
 /// What `parse` builds for a quoted phrase in the field at `place`.

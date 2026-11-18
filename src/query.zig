@@ -12,6 +12,9 @@ pub const phrase = @import("query/phrase.zig");
 /// The query language for people, read into a tree.
 pub const parse = @import("query/parse.zig");
 
+/// A regex term query's pattern, folded as a text field folds its terms.
+pub const pattern = @import("query/pattern.zig");
+
 /// Upper bounds on scores, for block-max WAND.
 pub const wand = @import("query/wand.zig");
 

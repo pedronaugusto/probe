@@ -278,6 +278,32 @@ pub const Fst = struct {
         pub const Entry = struct { key: []const u8, value: u64 };
 
         pub fn next(w: *Walk) (Error || error{KeyTooLong})!?Entry {
+            return w.nextWith(Every{});
+        }
+
+        /// What a visitor's `descend` fails with, the visitor given by value
+        /// or by pointer.
+        fn VisitorError(comptime V: type) type {
+            return switch (@typeInfo(V)) {
+                .pointer => |ptr| ptr.child.Error,
+                else => V.Error,
+            };
+        }
+
+        /// Every key: a visitor that passes over nothing.
+        pub const Every = struct {
+            pub const Error = error{};
+            pub fn descend(_: Every, _: []const u8) error{}!bool {
+                return true;
+            }
+        };
+
+        /// The next key `visitor` leads to. Before the walk takes a byte it
+        /// asks `visitor.descend(key)`, `key` the bytes to that byte and the
+        /// byte itself; false passes over every key below it, where the
+        /// visitor knows none can be wanted. A key returned is one the
+        /// visitor descended to byte by byte; accepting it is the caller's.
+        pub fn nextWith(w: *Walk, visitor: anytype) (Error || error{KeyTooLong} || VisitorError(@TypeOf(visitor)))!?Entry {
             while (w.depth != 0) {
                 const top = &w.frames[w.depth - 1];
                 const node = try w.fst.nodeAt(top.address);
@@ -290,8 +316,9 @@ pub const Fst = struct {
                     const t = try w.fst.pairAt(&top.at, top.address);
                     top.next += 1;
                     if (w.len == w.key.len) return error.KeyTooLong;
-                    const child = try w.fst.nodeAt(t.target);
                     w.key[w.len] = label;
+                    if (!try visitor.descend(w.key[0 .. w.len + 1])) continue;
+                    const child = try w.fst.nodeAt(t.target);
                     w.len += 1;
                     w.frames[w.depth] = .{ .address = t.target, .next = 0, .at = child.pairs, .out = std.math.add(u64, top.out, t.out) catch return error.Corrupt, .final_done = false };
                     w.depth += 1;

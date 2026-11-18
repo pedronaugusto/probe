@@ -25,6 +25,10 @@
             .url = "git+https://github.com/pedronaugusto/airlock#3ef2f541e9c487e62dd588d5675199d77bbca1ec",
             .hash = "airlock-0.6.0-rfvu6CbQCAB-yuZ--fdaXpnGAsCzkaeqnDWRLuQUcAgH",
         },
+        .spectra = .{
+            .url = "git+https://github.com/pedronaugusto/spectra#a60626923343b08b94aaf3730f6fa13e99e144a8",
+            .hash = "spectra-0.0.0-t6DGCJn6DQCHqvXOJuShfZpnHWiau9_DPzhmWZ-yScQi",
+        },
     },
     .dev_dependencies = .{
         .shakedown = .{

@@ -18,7 +18,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "index reader", .patterns = &.{"src/Reader.zig"} },
     .{ .name = "index merge", .patterns = &.{"src/merge.zig"} },
     .{ .name = "index", .patterns = &.{"src/Writer.zig"} },
-    .{ .name = "query base", .patterns = &.{ "src/bm25.zig", "src/query/Tree.zig", "src/query/phrase.zig", "src/query/wand.zig", "src/query/parse.zig" } },
+    .{ .name = "query base", .patterns = &.{ "src/bm25.zig", "src/query/Tree.zig", "src/query/phrase.zig", "src/query/wand.zig", "src/query/pattern.zig", "src/query/parse.zig" } },
     .{ .name = "query", .patterns = &.{"src/query/exec.zig"} },
     .{ .name = "query entry", .patterns = &.{"src/query.zig"} },
     .{ .name = "index api", .patterns = &.{"src/index.zig"} },
@@ -33,7 +33,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
     .{
         .name = "named dependencies",
         .unresolved_only = true,
-        .except_targets = &.{ "std", "aegis", "xenoglyph", "warp", "strand", "airlock", "airlock.testing", "shakedown", "builtin" },
+        .except_targets = &.{ "std", "aegis", "xenoglyph", "warp", "strand", "airlock", "airlock.testing", "spectra", "shakedown", "builtin" },
     },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
 };
@@ -76,6 +76,7 @@ pub const required = [_][]const u8{
     "src/query/Tree.zig",
     "src/query/phrase.zig",
     "src/query/wand.zig",
+    "src/query/pattern.zig",
     "src/query/parse.zig",
     "src/query/exec.zig",
     "src/query.zig",

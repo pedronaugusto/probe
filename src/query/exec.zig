@@ -13,6 +13,9 @@
 //! - A prefix expands through each segment's dictionary, at most
 //!   `Limits.expansions` terms in a segment (`error.TooManyTerms` past
 //!   them, before any is read), into the set of their documents.
+//! - A regex term walks each segment's dictionary by spectra's stepping
+//!   automaton, passing over a branch no term below can match, into the
+//!   set of its terms' documents, at most `Limits.expansions` of them.
 //! - A range passes a column block whose least and greatest value lie
 //!   outside it whole.
 //! - A disjunction at the root runs block-max WAND for the best hits:
@@ -41,6 +44,8 @@ const Limits = @import("../Limits.zig");
 const Reader = @import("../Reader.zig");
 const segment = @import("../segment.zig");
 const fst = @import("../encoding.zig").fst;
+const spectra = @import("spectra");
+const pattern = @import("pattern.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -468,6 +473,7 @@ const Plan = union(enum) {
     term: struct { term: Tree.Term, weight: bm25.Weight },
     phrase: struct { phrase: Tree.Phrase, weight: bm25.Weight },
     prefix: Tree.Term,
+    regex: struct { field: u32, compiled: *Compiled },
     range: Tree.Range,
     all,
     none,
@@ -488,6 +494,7 @@ fn planOf(arena: Allocator, io: Io, snapshot: *const Reader, stats: *const Stats
             return .{ .phrase = .{ .phrase = p, .weight = stats.weight(schema, p.field, sum) } };
         },
         .prefix => |t| .{ .prefix = t },
+        .regex => |x| .{ .regex = .{ .field = x.field, .compiled = try Compiled.of(arena, x) } },
         .range => |r| .{ .range = r },
         .all => .all,
         .none => .none,
@@ -905,6 +912,7 @@ fn compileNode(r: *Run, seg: *const segment.read.Segment, plan: *const Plan) Err
             return .{ .kind = .{ .phrase = ph } };
         },
         .prefix => |t| try prefixOf(r, seg, t),
+        .regex => |x| try regexOf(r, seg, x.field, x.compiled),
         .range => |range| {
             const it = try arena.create(Range);
             it.* = .{ .segment = seg, .range = range, .cursor = .init(seg.column(range.field)) };
@@ -991,11 +999,17 @@ fn prefixOf(r: *Run, seg: *const segment.read.Segment, t: Tree.Term) Error!Iter 
         if (addresses.items.len == r.limits.expansions) return error.TooManyTerms;
         try addresses.append(arena, try field.address(entry.value));
     }
-    if (addresses.items.len == 0) return .{ .kind = .none };
+    return setOf(r, seg, addresses.items);
+}
+
+/// The documents of the terms at `addresses` in `seg`, as one set.
+fn setOf(r: *Run, seg: *const segment.read.Segment, addresses: []const segment.terms.Address) Error!Iter {
+    const arena = r.segment_arena.allocator();
+    if (addresses.len == 0) return .{ .kind = .none };
     const set = try arena.create(Set);
     set.* = .{ .words = try arena.alloc(u64, (@as(usize, seg.docs) + 63) / 64), .count = 0 };
     @memset(set.words, 0);
-    for (addresses.items) |address| {
+    for (addresses) |address| {
         var p = try postings.Reader.init(seg.postings, r.io, address.postings, seg.docs);
         while (try p.next()) |posting| {
             const bit = @as(u64, 1) << @intCast(posting.doc % 64);
@@ -1007,3 +1021,129 @@ fn prefixOf(r: *Run, seg: *const segment.read.Segment, t: Tree.Term) Error!Iter 
     }
     return .{ .kind = .{ .set = set } };
 }
+
+/// A regex term query's pattern compiled once for a search, with the stores
+/// its walks and searches use, kept where they are while it runs.
+const Compiled = struct {
+    regex: spectra.Regex,
+    /// The stepping automaton and its store: null where the pattern has none
+    /// (no lazy DFA, or a Unicode word boundary), and the walks prune nothing.
+    automaton: ?spectra.Automaton = null,
+    steps: ?spectra.Automaton.Cache = null,
+    /// The whole-term searches' store, made the first time one is needed.
+    search: ?spectra.Regex.Cache = null,
+
+    fn of(arena: Allocator, r: Tree.Regex) Error!*Compiled {
+        const c = try arena.create(Compiled);
+        c.* = .{ .regex = spectra.Regex.compile(arena, .init(r.pattern), pattern.options(r.fold)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid, error.Unsupported, error.TooLarge => aegis.assert.never("the parser compiled the pattern"),
+        } };
+        c.automaton = c.regex.automaton();
+        if (c.automaton) |a| c.steps = try a.cache(arena);
+        return c;
+    }
+};
+
+/// The documents of every term of the field at `field` in `seg` that the
+/// pattern matches whole: at most `Limits.expansions` terms.
+fn regexOf(r: *Run, seg: *const segment.read.Segment, field_place: u32, compiled: *Compiled) Error!Iter {
+    const arena = r.segment_arena.allocator();
+    const field = try seg.dictionary.field(field_place) orelse return .{ .kind = .none };
+    const key = try arena.alloc(u8, r.term_bytes);
+    const frames = try arena.alloc(fst.Fst.Frame, key.len + 1);
+    var matcher: Matcher = .{ .arena = r.arena, .compiled = compiled, .states = try arena.alloc(spectra.Automaton.State, key.len + 1) };
+    matcher.begin();
+    var addresses: std.ArrayList(segment.terms.Address) = .empty;
+    var walk = try field.keys.walk("", key, frames);
+    while (walk.nextWith(&matcher) catch return error.Corrupt) |entry| {
+        if (!try matcher.accepts(entry.key)) continue;
+        if (addresses.items.len == r.limits.expansions) return error.TooManyTerms;
+        try addresses.append(arena, try field.address(entry.value));
+    }
+    return setOf(r, seg, addresses.items);
+}
+
+/// A walk of a segment's terms by the stepping automaton: a branch whose
+/// state is dead is passed over, and a term is taken where the state after
+/// it, at the end, is a match. On `Stale` the path is walked again into the
+/// same store, and on `GaveUp` (or re-walks past ten times the bytes the
+/// walk stepped) the walk prunes nothing more and takes each term by a
+/// whole-term search: Automaton.zig's recipe, so the terms are the ones an
+/// unbounded store would give.
+const Matcher = struct {
+    arena: Allocator,
+    compiled: *Compiled,
+    /// The state after each byte of the path, the start's first.
+    states: []spectra.Automaton.State,
+    pruning: bool = false,
+    stepped: u64 = 0,
+    rewalked: u64 = 0,
+
+    pub const Error = error{};
+
+    fn begin(m: *Matcher) void {
+        const a = m.compiled.automaton orelse return;
+        m.states[0] = a.start(&m.compiled.steps.?, .{}) catch return;
+        m.pruning = true;
+    }
+
+    /// Whether a term may lie below `key`, its last byte the one stepped.
+    pub fn descend(m: *Matcher, key: []const u8) error{}!bool {
+        if (!m.pruning) return true;
+        const a = m.compiled.automaton.?;
+        const steps = &m.compiled.steps.?;
+        m.stepped += 1;
+        const state = a.step(steps, m.states[key.len - 1], key[key.len - 1]) catch |err| switch (err) {
+            error.GaveUp => return m.giveUp(),
+            error.Stale => if (m.rewalk(key[0 .. key.len - 1])) (a.step(steps, m.states[key.len - 1], key[key.len - 1]) catch return m.giveUp()) else return m.giveUp(),
+        };
+        m.states[key.len] = state;
+        return !spectra.Automaton.isDead(state);
+    }
+
+    /// Whether `key`, which the walk descended to, matches whole.
+    fn accepts(m: *Matcher, key: []const u8) Allocator.Error!bool {
+        if (m.pruning) {
+            if (m.endState(key)) |end| return spectra.Automaton.isMatch(end);
+            _ = m.giveUp();
+        }
+        const c = m.compiled;
+        if (c.search == null) c.search = try c.regex.cache(m.arena);
+        const found = c.regex.find(&c.search.?, .{ .haystack = key, .span = .{ .start = 0, .end = key.len }, .whole = true }) catch
+            aegis.assert.never("the parser refused a pattern whose lookaround a term could pass");
+        return found != null;
+    }
+
+    /// The state after `key` at its end, re-walking it once where its
+    /// states are stale; null where the store gives up.
+    fn endState(m: *Matcher, key: []const u8) ?spectra.Automaton.State {
+        const a = m.compiled.automaton.?;
+        const steps = &m.compiled.steps.?;
+        return a.stepEnd(steps, m.states[key.len]) catch |err| switch (err) {
+            error.GaveUp => null,
+            error.Stale => if (m.rewalk(key)) a.stepEnd(steps, m.states[key.len]) catch null else null,
+        };
+    }
+
+    /// The states of `path` again, from the start, into the store; false
+    /// where a re-walk is stale too or the re-walks pass ten times the
+    /// bytes the walk stepped.
+    fn rewalk(m: *Matcher, path: []const u8) bool {
+        const a = m.compiled.automaton.?;
+        const steps = &m.compiled.steps.?;
+        m.states[0] = a.start(steps, .{}) catch return false;
+        for (path, 1..) |byte, i| {
+            m.rewalked += 1;
+            if (m.rewalked > 10 * m.stepped) return false;
+            m.states[i] = a.step(steps, m.states[i - 1], byte) catch return false;
+        }
+        return true;
+    }
+
+    /// No more pruning: every branch is walked, every term searched.
+    fn giveUp(m: *Matcher) bool {
+        m.pruning = false;
+        return true;
+    }
+};

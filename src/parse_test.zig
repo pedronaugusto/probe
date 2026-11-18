@@ -43,6 +43,7 @@ fn equal(a: *const Node, b: *const Node) bool {
     return switch (a.*) {
         .term => |t| t.field == b.term.field and std.mem.eql(u8, t.bytes, b.term.bytes),
         .prefix => |t| t.field == b.prefix.field and std.mem.eql(u8, t.bytes, b.prefix.bytes),
+        .regex => |x| x.field == b.regex.field and x.fold == b.regex.fold and std.mem.eql(u8, x.pattern, b.regex.pattern),
         .phrase => |p| p.field == b.phrase.field and p.slop == b.phrase.slop and std.mem.eql(u32, p.positions, b.phrase.positions) and p.terms.len == b.phrase.terms.len and for (p.terms, b.phrase.terms) |x, y| {
             if (!std.mem.eql(u8, x, y)) break false;
         } else true,
@@ -217,6 +218,14 @@ fn print(out: *std.Io.Writer, node: *const Node) !void {
             }
         },
         .prefix => |t| try out.print("{s}:{s}*", .{ schema[t.field].name, t.bytes }),
+        .regex => |x| {
+            try out.print("{s}:/", .{schema[x.field].name});
+            for (x.pattern) |c| {
+                if (c == '/') try out.writeByte('\\');
+                try out.writeByte(c);
+            }
+            try out.writeByte('/');
+        },
         .phrase => |p| {
             try out.print("{s}:\"", .{schema[p.field].name});
             for (p.terms, 0..) |t, i| try out.print("{s}{s}", .{ if (i > 0) " " else "", t });

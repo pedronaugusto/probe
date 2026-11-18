@@ -15,6 +15,7 @@ const Tree = query.Tree;
 const exec = query.exec;
 const bm25 = @import("../bm25.zig");
 const Schema = @import("../Schema.zig");
+const spectra = @import("spectra");
 
 const Allocator = std.mem.Allocator;
 const Node = Tree.Node;
@@ -127,6 +128,27 @@ pub const Snapshot = struct {
                 },
                 .keyword => |k| return if (std.mem.startsWith(u8, k, t.bytes)) 1 else null,
                 .numeric => unreachable,
+            },
+            .regex => |x| {
+                // Every term searched whole, nothing pruned: what the walk's pruning must give.
+                var re = spectra.Regex.compile(gpa, .init(x.pattern), query.pattern.options(x.fold)) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => unreachable, // unreachable: the parser compiled it
+                };
+                defer re.deinit();
+                var c = try re.cache(gpa);
+                defer c.deinit();
+                const whole = struct {
+                    fn of(r: *const spectra.Regex, cache: *spectra.Regex.Cache, term: []const u8) bool {
+                        return (r.find(cache, .{ .haystack = term, .span = .{ .start = 0, .end = term.len }, .whole = true }) catch unreachable) != null; // unreachable: no lookaround in these patterns
+                    }
+                };
+                switch (d.values[x.field]) {
+                    .text => |tokens| for (tokens) |tk| if (whole.of(&re, &c, tk.term)) return 1,
+                    .keyword => |k| if (whole.of(&re, &c, k)) return 1,
+                    .numeric => unreachable,
+                }
+                return null;
             },
             .range => |r| {
                 const v = d.values[r.field].numeric;

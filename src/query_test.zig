@@ -45,6 +45,10 @@ const words = [_][]const u8{ "alpha", "beta", "gamma", "delta", "parseSpan", "x"
 /// document holds.
 const terms = [_][]const u8{ "alpha", "beta", "gamma", "delta", "parsespan", "parse", "span", "x", "httpserver", "http", "server", "e2e", "omega", "absent" };
 const tags = [_][]const u8{ "a", "ab", "b", "abc" };
+/// Regex term patterns, folded already (lowercase ASCII folds to itself), of
+/// body's terms and of tag's: some match many terms, some one, some none.
+const body_patterns = [_][]const u8{ "al.*", "(parse|span)", ".*ta", "x|e2e", "h.*r", "[a-d].*", "omegas?", ".*", "zz.*", "p.r.*" };
+const tag_patterns = [_][]const u8{ "a.*", "ab?", "b|abc", "c", ".*" };
 
 /// A version of a document as added.
 const Version = struct {
@@ -125,10 +129,16 @@ fn queryOf(arena: std.mem.Allocator, s: *shakedown.Source, depth: u8) !Node {
             }
             break :p .{ .phrase = .{ .field = body, .terms = ts, .positions = ps, .slop = gen.intRange(s, u32, 0, 3) } };
         },
-        6 => if (gen.boolean(s)) p: {
-            const t = termOf(s);
-            break :p .{ .prefix = .{ .field = body, .bytes = t[0..gen.intRange(s, usize, 0, @min(t.len, 2))] } };
-        } else .{ .prefix = .{ .field = tag, .bytes = "ab"[0..gen.intRange(s, usize, 0, 2)] } },
+        6 => switch (gen.intRange(s, u8, 0, 3)) {
+            0 => p: {
+                const t = termOf(s);
+                break :p .{ .prefix = .{ .field = body, .bytes = t[0..gen.intRange(s, usize, 0, @min(t.len, 2))] } };
+            },
+            1 => .{ .prefix = .{ .field = tag, .bytes = "ab"[0..gen.intRange(s, usize, 0, 2)] } },
+            // A regex term: the walk prunes by the automaton, the reference searches every term.
+            2 => .{ .regex = .{ .field = body, .pattern = body_patterns[gen.intRange(s, usize, 0, body_patterns.len - 1)], .fold = true } },
+            else => .{ .regex = .{ .field = tag, .pattern = tag_patterns[gen.intRange(s, usize, 0, tag_patterns.len - 1)], .fold = false } },
+        },
         7 => r: {
             const a = gen.intRange(s, u64, 0, 1000);
             break :r .{ .range = .{ .field = n_field, .min = a, .max = a + gen.intRange(s, u64, 0, 400) } };

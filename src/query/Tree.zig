@@ -13,6 +13,8 @@
 //!   length past the phrase's (so 1 per match when exact).
 //! - `prefix`: the documents holding a term that starts with its bytes,
 //!   scored 1.
+//! - `regex`: the documents holding a term its pattern matches whole, scored
+//!   1; the pattern folded as a text field folds its terms (`pattern.zig`).
 //! - `range`: the documents whose column value lies in its bounds, both
 //!   included, scored 1.
 //! - `all`: every document, scored 1; `none`: no document.
@@ -40,6 +42,7 @@ pub const Node = union(enum) {
     term: Term,
     phrase: Phrase,
     prefix: Term,
+    regex: Regex,
     range: Range,
     all,
     none,
@@ -53,6 +56,14 @@ pub const Node = union(enum) {
 pub const Term = struct {
     field: u32,
     bytes: []const u8,
+};
+
+/// A regex term query: `pattern` as `pattern.prepare` made it, read
+/// case-insensitive where `fold` (a text field's).
+pub const Regex = struct {
+    field: u32,
+    pattern: []const u8,
+    fold: bool,
 };
 
 /// Terms of a text field that keeps positions, each with its position in
@@ -113,6 +124,10 @@ fn checkAt(node: *const Node, schema: []const Schema.Field, limits: Limits, clau
             for (p.positions[1..], p.positions[0 .. p.positions.len - 1]) |after, before| {
                 if (after <= before) return error.Invalid;
             }
+        },
+        .regex => |r| {
+            const kind = (try fieldOf(schema, r.field)).kind;
+            if (kind == .numeric or r.fold != (kind == .text)) return error.Invalid;
         },
         .range => |r| if ((try fieldOf(schema, r.field)).kind != .numeric) return error.Invalid,
         .all, .none => {},
