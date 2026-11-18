@@ -25,12 +25,14 @@ const schema = [_]Schema.Field{
     .{ .name = "level", .kind = .keyword },
     .{ .name = "n", .kind = .numeric },
     .{ .name = "at", .kind = .numeric, .signed = true },
+    .{ .name = "path", .kind = .keyword },
 };
 const body = 0;
 const title = 1;
 const level = 2;
 const n_field = 3;
 const at_field = 4;
+const path = 5;
 
 fn read(text: []const u8, options: parse.Options) parse.Error!Tree {
     return parse.parse(testing.allocator, &schema, .init(text), options);
@@ -102,6 +104,14 @@ test "each form of the language reads as its tree" {
     try expectReads("*", .all);
     try expectReads("*:*", .all);
     try expectReads("level:a\\:b\\*", term(level, "a:b*"));
+    // The design's example: a phrase in the default fields that keep
+    // positions, a level, a path prefix, a word excluded.
+    try expectReads("\"segment merge\" level:err path:src/* -test", .{ .@"and" = &.{
+        .{ .phrase = .{ .field = body, .terms = &.{ "segment", "merge" }, .positions = &.{ 0, 1 } } },
+        term(level, "err"),
+        .{ .prefix = .{ .field = path, .bytes = "src/" } },
+        .{ .not = &anyText("test") },
+    } });
     // Words that analyze to nothing leave no clause.
     try expectReads("body:!!! body:alpha", term(body, "alpha"));
 }
@@ -263,7 +273,7 @@ test "a query's words meet the indexed text through the same analysis" {
     defer w.deinit(io);
     const texts = [_][]const u8{ "we call parseSpan here", "parse the span", "a parse span" };
     for (texts, 0..) |t, id| {
-        const values = [_]segment.write.Value{ .{ .text = t }, .{ .text = "" }, .{ .keyword = "INFO" }, .{ .numeric = @intCast(id) }, .{ .numeric = 0 } };
+        const values = [_]segment.write.Value{ .{ .text = t }, .{ .text = "" }, .{ .keyword = "INFO" }, .{ .numeric = @intCast(id) }, .{ .numeric = 0 }, .{ .keyword = "src/a.zig" } };
         try w.add(io, .{ .id = @intCast(id), .values = &values });
     }
     _ = try w.commit(io);

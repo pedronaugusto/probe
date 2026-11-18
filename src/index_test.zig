@@ -1,8 +1,8 @@
 //! The index of a document type, as a program uses it: documents added and
 //! committed, a snapshot searched by a query parsed or built, hits sorted
 //! and paged, totals counted to a threshold, stored fields read back typed,
-//! a hit of another snapshot refused, and an index that will not open
-//! saying why and where.
+//! a hit of another snapshot refused, an index that will not open saying
+//! why and where, and an aegis instant as a numeric field.
 const std = @import("std");
 const aegis = @import("aegis");
 const probe = @import("probe.zig");
@@ -233,4 +233,39 @@ test "a document whose text passes the limit is refused before it is analyzed" {
     defer w.deinit(io);
     try testing.expectError(error.FieldTooLong, w.add(io, entry(1, 0, "ERR", "too long a message")));
     try w.add(io, entry(2, 0, "ERR", "short"));
+}
+
+const Event = struct {
+    seq: u64,
+    at: aegis.units.Instant(.real, .millisecond, i64),
+    what: []const u8,
+    pub const probe = .{ .id = .seq, .fields = .{ .at = .{ .numeric = .{ .stored = true } }, .what = .{ .text = .{} } } };
+};
+
+test "an aegis instant is a numeric field: ranged in its own type, sorted by, read back typed" {
+    const Events = probe.Index(Event);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const w = try Events.openWriter(testing.allocator, io, tmp.dir, .{ .durability = .none });
+    defer w.deinit(io);
+    for ([_]i64{ 1500, -2000, 0, -1 }, 1..) |ms, seq| try w.add(io, .{ .seq = seq, .at = .fromRaw(ms), .what = "tick" });
+    var result = try w.commit(io);
+    var generation: u64 = undefined;
+    result.take(&generation);
+    const r = try w.reader();
+    defer r.deinit();
+    var b: Events.Query.Builder = .init(testing.allocator);
+    defer b.deinit();
+    // From a millisecond before the epoch on: the signed order holds.
+    var q = try b.build(b.range(.at, .fromRaw(-1), null));
+    defer q.deinit();
+    var hits = try r.search(io, &q, .{ .sort = .{ .field = .{ .by = .at, .order = .ascending } } });
+    defer hits.deinit();
+    var buffer: [4]u64 = undefined;
+    for (hits.hits, buffer[0..hits.hits.len]) |h, *o| o.* = h.id.raw();
+    try testing.expectEqualSlices(u64, &.{ 4, 3, 1 }, buffer[0..hits.hits.len]);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const stored = try r.stored(io, hits.hits[0], arena.allocator());
+    try testing.expectEqual(@as(i64, -1), stored.at.raw());
 }

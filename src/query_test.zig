@@ -1,7 +1,8 @@
 //! Queries against the exact reference (`testing/reference.zig`): over
 //! snapshots of several segments with skewed statistics (a segment of long
 //! documents beside one of short ones, a term common in one segment and
-//! rare in the rest, documents deleted, updated and merged away), every
+//! rare in the rest, documents deleted, updated and merged away, segments
+//! added and merged between queries on a snapshot reopened), every
 //! query's best hits equal the reference's bit for bit in score and order,
 //! its count equals the reference's, and every score is within 1e-5 of
 //! BM25 computed apart in `f64`. A phrase's frequency equals the one found
@@ -158,8 +159,14 @@ fn queryOf(arena: std.mem.Allocator, s: *shakedown.Source, depth: u8) !Node {
 /// each segment of its own lengths and its own common word, with updates,
 /// deletes and merges among them; every version added is in `versions`.
 fn fill(w: *Writer, arena: std.mem.Allocator, s: *shakedown.Source, versions: *std.ArrayList(Version), segments: usize, docs: usize) !void {
-    for (0..gen.intRange(s, usize, 1, segments)) |_| {
-        const long = gen.intRange(s, usize, 1, 40);
+    for (0..gen.intRange(s, usize, 1, segments)) |i| {
+        // The first segment short, the second long: their average lengths
+        // differ tenfold at least.
+        const long = switch (i) {
+            0 => gen.intRange(s, usize, 1, 3),
+            1 => gen.intRange(s, usize, 30, 40),
+            else => gen.intRange(s, usize, 1, 40),
+        };
         const common: ?[]const u8 = if (gen.boolean(s)) words[gen.intRange(s, usize, 0, words.len - 1)] else null;
         for (0..gen.intRange(s, usize, 1, docs)) |_| {
             const update = versions.items.len > 0 and gen.intRange(s, u8, 0, 5) == 0;
@@ -233,15 +240,30 @@ fn matchesReference(_: void, case: *shakedown.Case) anyerror!void {
     try fill(&w, arena, s, &versions, 4, 60);
     var r = try Reader.open(gpa, io, tmp.dir, &schema, .{});
     defer r.deinit();
-    const ref = try referenceOf(arena, &r, versions.items);
+    const before = try referenceOf(arena, &r, versions.items);
+    try expectQueries(arena, s, &r, before);
+    // Segments added and merged between queries: the snapshot reopened
+    // answers by its own statistics, none older, and the one before by
+    // its own still.
+    try fill(&w, arena, s, &versions, 3, 60);
+    var reopened = try r.reopen(io);
+    defer reopened.deinit();
+    try expectQueries(arena, s, &reopened, try referenceOf(arena, &reopened, versions.items));
+    try expectQueries(arena, s, &r, before);
+}
+
+/// Queries of every shape over `r`, each equal to the reference's: its
+/// best hits, top 1000 among them, a page after one of them, its count.
+fn expectQueries(arena: std.mem.Allocator, s: *shakedown.Source, r: *const Reader, ref: reference.Snapshot) !void {
+    const gpa = testing.allocator;
     for (0..8) |_| {
         const root = try queryOf(arena, s, 3);
         try Tree.check(&root, &schema, .{});
-        const top = gen.intRange(s, u32, 1, 50);
+        const top = if (gen.intRange(s, u8, 0, 3) == 0) 1000 else gen.intRange(s, u32, 1, 50);
         const wand = gen.boolean(s);
-        _ = try expectHits(&r, ref, &root, top, wand);
-        try expectPage(&r, ref, &root, top, wand, gen.intRange(s, u32, 0, 20));
-        try testing.expectEqual(try ref.count(gpa, &root), try exec.count(gpa, io, &r, &root, .{}));
+        _ = try expectHits(r, ref, &root, top, wand);
+        try expectPage(r, ref, &root, top, wand, gen.intRange(s, u32, 0, 20));
+        try testing.expectEqual(try ref.count(gpa, &root), try exec.count(gpa, io, r, &root, .{}));
     }
 }
 

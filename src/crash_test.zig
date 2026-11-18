@@ -5,8 +5,11 @@
 //! the index as a program restarting would,
 //! removing what the crash left, and the index is checked for what a
 //! commit promises: it holds exactly the documents of one commit, no older
-//! than the last that returned and no newer than the one under way, and no
-//! temporary file is left.
+//! than the last that returned and no newer than the one under way, every
+//! file it names verifies by its checksums, and no temporary file is left.
+//! Then every single fault at every call of a commit and a merge on a real
+//! directory (shakedown's `everyFault`: an error from any call, a short
+//! write, a cancel), each checked the same way once a writer reopens it.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -149,6 +152,16 @@ pub const Operation = struct {
             else => return err,
         };
         defer r.deinit();
+        // Every file the commit names holds every byte its checksums say.
+        var buffer: [4096]u8 = undefined;
+        for (r.segments) |*seg| {
+            try verifyFile(hooked, dir, .{ .kind = .segment, .segment = seg.number() }, 0, &buffer);
+            switch (seg.deletions) {
+                .committed => |generation| try verifyFile(hooked, dir, .{ .kind = .deletions, .segment = seg.number() }, generation, &buffer),
+                .none => {},
+                .unsaved => return error.NotACommit,
+            }
+        }
         var held: std.ArrayList(Doc) = .empty;
         defer held.deinit(testing.allocator);
         try snapshots.holds(&r, hooked, testing.allocator, &held);
@@ -164,6 +177,13 @@ pub const Operation = struct {
         return error.NotACommit;
     }
 };
+
+fn verifyFile(io: Io, dir: Io.Dir, e: segment.files.Expected, generation: u64, buffer: []u8) !void {
+    var name_buffer: [segment.files.max_name_bytes]u8 = undefined;
+    const file = try dir.openFile(io, segment.files.name(&name_buffer, e.segment, e.kind, generation), .{});
+    defer file.close(io);
+    try e.verify(io, file, buffer);
+}
 
 fn everyCrashIn(shard: shakedown.EveryCrashOptions.Shard, merge: bool) !void {
     var ctx: Operation = .{ .merge = merge };
@@ -226,4 +246,147 @@ test "every crash: two commits and a merge, points 3 of 4" {
 
 test "every crash: two commits and a merge, points 4 of 4" {
     try everyCrashIn(.{ .index = 3, .count = 4 }, true);
+}
+
+const merge_options: Writer.Options = .{ .merge = .{ .segments_per_tier = 2, .max_merge_at_once = 2 } };
+
+/// The failures tried at each of airlock's calls, those the call can
+/// return: an I/O error, a full disk, an interruption, a refusal, a cancel.
+fn faultClasses(call: seam.Call) []const shakedown.IoFault {
+    const F = shakedown.IoFault;
+    if (os == .windows) {
+        const common = [_]F{ .{ .fail = error.IO_DEVICE_ERROR }, .{ .fail = error.DISK_FULL }, .{ .fail = error.Canceled } };
+        return switch (call) {
+            .win_rename_ex, .rename, .open_dir => &(common ++ [_]F{ .{ .fail = error.SHARING_VIOLATION }, .{ .fail = error.DELETE_PENDING } }),
+            .create_temp => &(common ++ [_]F{.{ .fail = error.DELETE_PENDING }}),
+            .close, .volume_name, .stat_id => &.{},
+            else => &common,
+        };
+    }
+    const common = [_]F{ .{ .fail = error.IO }, .{ .fail = error.NOSPC }, .{ .fail = error.INTR }, .{ .fail = error.Canceled } };
+    return switch (call) {
+        .create_temp => &.{ .{ .fail = error.ACCES }, .{ .fail = error.NOSPC }, .{ .fail = error.INTR }, .{ .fail = error.Canceled } },
+        .open_dir, .open_file, .unlink => &.{ .{ .fail = error.ACCES }, .{ .fail = error.INTR }, .{ .fail = error.Canceled } },
+        .stat_id, .getfl => &.{ .{ .fail = error.ACCES }, .{ .fail = error.INTR } },
+        .close => &.{ .{ .fail = error.IO }, .{ .fail = error.INTR } },
+        else => &common,
+    };
+}
+
+/// Every single fault at every step of a second commit and a merge, on a
+/// real directory holding a first commit: an error from any call, a short
+/// write, a cancel. Whatever failed, a writer opens
+/// the index afterwards as a program restarting would, and the index holds
+/// exactly the documents of one commit, no older than the last that
+/// returned and no newer than the one under way, every file it names
+/// verifies, and no temporary file is left.
+pub const Faulted = struct {
+    tmp: testing.TmpDir = undefined,
+    h: *Seam = undefined,
+    acknowledged: usize = 0,
+
+    pub fn setUp(s: *Faulted, fio: *shakedown.FaultIo) !void {
+        s.tmp = testing.tmpDir(.{ .iterate = true });
+        errdefer s.tmp.cleanup();
+        {
+            var w: Writer = try .open(testing.allocator, testing.io, s.tmp.dir, &schema, merge_options);
+            defer w.deinit(testing.io);
+            for ([_]u64{ 1, 2, 3 }, 0..) |id, serial| try add(&w, testing.io, id, @intCast(serial), false);
+            _ = try w.commit(testing.io);
+        }
+        s.h = try Seam.over(testing.allocator, fio, .{});
+        s.acknowledged = 1;
+    }
+
+    pub fn tearDown(s: *Faulted) void {
+        s.h.destroy();
+        s.tmp.cleanup();
+    }
+
+    pub fn run(s: *Faulted, base: Io) !void {
+        _ = base;
+        const io = s.h.io();
+        var w: Writer = try .open(testing.allocator, io, s.tmp.dir, &schema, merge_options);
+        defer w.deinit(io);
+        try add(&w, io, 4, 3, false);
+        try w.delete(2);
+        _ = try w.commit(io);
+        s.acknowledged = 2;
+        if (try w.mergeStep(io, null) == null) return error.NoMerge;
+        s.acknowledged = 3;
+    }
+
+    pub fn faultsFor(s: *Faulted, record: shakedown.IoTrace.Record) []const shakedown.IoFault {
+        _ = s;
+        const f = record.event.foreign orelse return &.{};
+        return faultClasses(@fromBackingInt(@as(u8, @intCast(f.call))));
+    }
+
+    pub fn check(s: *Faulted, base: Io, result: anyerror!void, injected: ?shakedown.Injected) !void {
+        _ = base;
+        _ = injected;
+        if (result) |_| {
+            if (s.acknowledged != 3) return error.NotACommit;
+        } else |_| {}
+        const dir = s.tmp.dir;
+        {
+            var w: Writer = try .open(testing.allocator, testing.io, dir, &schema, merge_options);
+            w.deinit(testing.io);
+        }
+        var it = dir.iterate();
+        while (try it.next(testing.io)) |entry| {
+            if (std.mem.startsWith(u8, entry.name, Writer.temp_prefix)) return error.TempLeft;
+        }
+        var r = try Reader.open(testing.allocator, testing.io, dir, &schema, .{});
+        defer r.deinit();
+        var buffer: [4096]u8 = undefined;
+        for (r.segments) |*seg| {
+            try verifyFile(testing.io, dir, .{ .kind = .segment, .segment = seg.number() }, 0, &buffer);
+            switch (seg.deletions) {
+                .committed => |generation| try verifyFile(testing.io, dir, .{ .kind = .deletions, .segment = seg.number() }, generation, &buffer),
+                .none => {},
+                .unsaved => return error.NotACommit,
+            }
+        }
+        var held: std.ArrayList(Doc) = .empty;
+        defer held.deinit(testing.allocator);
+        try snapshots.holds(&r, testing.io, testing.allocator, &held);
+        const last: usize = @min(s.acknowledged + 1, merged.len - 1);
+        for (merged[s.acknowledged .. last + 1]) |want| {
+            if (want.len == held.items.len and for (want, held.items) |a, b| {
+                if (!std.meta.eql(a, b)) break false;
+            } else true) return;
+        }
+        std.debug.print("acknowledged {d}, held {any}\n", .{ s.acknowledged, held.items });
+        return error.NotACommit;
+    }
+};
+
+fn everyFaultIn(shard: @FieldType(shakedown.EveryFaultOptions, "shard")) !void {
+    var ctx: Faulted = .{};
+    var report: shakedown.EveryFaultReport = .{};
+    defer report.deinit();
+    // No task runs concurrently: airlock then syncs a batch's files one
+    // after another, so every run makes its calls in one order.
+    var serial: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer serial.deinit();
+    const result = shakedown.everyFault(testing.allocator, serial.io(), &ctx, .{
+        .errors = &.{ error.InputOutput, error.NoSpaceLeft },
+        // Whether a remap moves the block is the allocator's, so a run that
+        // refuses one is not held to the clean run's calls.
+        .alloc = false,
+        .diagnostics = &report,
+        .shard = shard,
+    });
+    const done = result catch |err| {
+        if (report.failure) |f| std.debug.print("every fault: {t} at {any} difference {any}\n{s}\n", .{ f.err, f.injected, f.difference, f.trace });
+        return err;
+    };
+    try testing.expect(done.runs > 1);
+}
+
+// Measured on macOS: the clean run is 217 steps and the sweep 412 runs,
+// under half a minute in Debug.
+test "every fault: a commit and a merge, any call failing, leave one commit whole" {
+    try everyFaultIn(.{});
 }
