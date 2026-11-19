@@ -1,7 +1,7 @@
 # probe
 
 probe is a full-text search library for Zig: an inverted index of immutable segments with
-BM25 ranking; term, phrase and prefix queries; adds and deletes that a refresh makes
+BM25 ranking; term, phrase, prefix and regex queries; adds and deletes that a refresh makes
 visible; and merges that run when the program asks for them. xenoglyph splits text into
 words, and every file is written and committed through airlock, so a crash leaves the
 last commit readable.
@@ -56,7 +56,7 @@ std.debug.assert(std.mem.eql(u8, stored.level, "ERR"));
 <!-- END GENERATED -->
 
 Built so far: the analysis of text into terms, the segment files, the writer with its commits
-and tiered merges, snapshots, queries (terms, phrases with slop, prefixes, numeric ranges, and,
+and tiered merges, snapshots, queries (terms, phrases with slop, prefixes, regex terms, numeric ranges, and,
 or, not and boosts, from the query language or built in code) ranked by BM25 with block-max
 WAND, sorting by a numeric field, paging by cursor, and stored fields read back typed.
 

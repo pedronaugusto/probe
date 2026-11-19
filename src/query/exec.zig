@@ -1084,8 +1084,14 @@ const Matcher = struct {
 
     fn begin(m: *Matcher) void {
         const a = m.compiled.automaton orelse return;
-        m.states[0] = a.start(&m.compiled.steps.?, .{}) catch return;
-        m.pruning = true;
+        // A start state the store cannot give leaves pruning off: every
+        // term is then taken by a whole-term search.
+        m.pruning = if (a.start(&m.compiled.steps.?, .{})) |state| p: {
+            m.states[0] = state;
+            break :p true;
+        } else |err| switch (err) {
+            error.GaveUp, error.Stale => false,
+        };
     }
 
     /// Whether a term may lie below `key`, its last byte the one stepped.

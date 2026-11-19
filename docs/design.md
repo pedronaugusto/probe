@@ -83,6 +83,15 @@ positions; prefixes expand through each segment's FST up to `Limits.expansions` 
 `TooManyTerms`, before any postings are read); numeric ranges skip column blocks by their min and max.
 Deleted documents are dropped as hits are collected.
 
+**Regex terms.** A `/pattern/` walks each segment's FST with spectra's stepping automaton: a branch whose
+state is dead is passed over, and a term is taken where the state at its end is a match, up to
+`Limits.expansions` terms like a prefix. When the automaton's store gives up, the walk prunes nothing
+more and takes each term by a whole-term search, so the terms are always those the pattern matches
+whole. On a text field the pattern's literals are folded as the field folds its terms (NFKC_Casefold,
+which spectra's case-insensitive mode alone does not give: `ß` and `ss`, ligatures, fullwidth forms) and
+it matches case-insensitive; on a keyword field it reads bytes as they are. A pattern is compiled once
+per search, and one with a lookaround is refused where the terms can be longer than it can search.
+
 **Scoring** is Lucene's. A term scores BM25 with `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` and
 `idf * f / (f + k1 * (1 - b + b * length / average))` (1.2 and 0.75 by default). A phrase matches its
 terms in order within `slop` extra positions and scores with its terms' idfs summed and a sloppy
@@ -111,7 +120,7 @@ deterministic list and a `Cursor` resumes it exactly.
 **The query language.** Clauses side by side all match (`AND` says the same), `OR` binds looser, `NOT x`
 or `-x` excludes, parentheses group. A word with no field searches the default fields, each through its
 own analysis: one term, or when it splits, the phrase of its parts. `field:word`, `field:(...)`,
-`"..."~slop`, `word*`, `field:[a TO b]` with `*` open, `field:5`, `*`, `^boost`, `\` escaping a byte. A
+`"..."~slop`, `word*`, `/pattern/` with `\/` a slash, `field:[a TO b]` with `*` open, `field:5`, `*`, `^boost`, `\` escaping a byte. A
 query that does not read fails with a `Problem` at its byte.
 
 ## Merges
@@ -172,5 +181,5 @@ return `aegis.own.MustUse`.
 ## Dependencies
 
 xenoglyph (words, NFKC_Casefold, categories), airlock (atomic files, batches, the directory sync), warp
-(CRC-32C, LZ4), strand (the manifest), aegis. A consumer
+(CRC-32C, LZ4), strand (the manifest), spectra (regex term queries), aegis. A consumer
 fetches those and nothing else: probe has no optional module.

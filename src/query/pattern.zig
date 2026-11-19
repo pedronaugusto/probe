@@ -123,11 +123,11 @@ fn headEnd(pattern: []const u8, at: usize) usize {
 /// escaped. Returns where the unit ends.
 fn foldUnit(arena: Allocator, out: *std.ArrayList(u8), pattern: []const u8, at: usize) Allocator.Error!usize {
     var end = nextCodePoint(pattern, at);
+    // An ill-formed byte reads as U+FFFD, of class 0, and ends the unit.
     while (end < pattern.len and end - at < unit_bytes) {
-        const after = nextCodePoint(pattern, end);
-        const cp = std.unicode.utf8Decode(pattern[end..after]) catch break;
-        if (xenoglyph.normalize.combiningClass(cp) == 0) break;
-        end = after;
+        const d = xenoglyph.utf8.decode(pattern[end..]);
+        if (xenoglyph.normalize.combiningClass(d.code_point) == 0) break;
+        end += d.len;
     }
     const unit = pattern[at..end];
     // Bytes that are not UTF-8 are the compiler's to refuse.
@@ -148,10 +148,9 @@ fn foldUnit(arena: Allocator, out: *std.ArrayList(u8), pattern: []const u8, at: 
     return end;
 }
 
-/// Where the code point at `at` ends; a byte that begins none, after it.
+/// Where the code point at `at` ends; an ill-formed subpart, after it.
 fn nextCodePoint(pattern: []const u8, at: usize) usize {
-    const len = std.unicode.utf8ByteSequenceLength(pattern[at]) catch 1;
-    return @min(at + len, pattern.len);
+    return at + xenoglyph.utf8.decode(pattern[at..]).len;
 }
 
 test "a pattern's literals fold as a text field's terms do, and its syntax stays" {

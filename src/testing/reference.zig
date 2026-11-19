@@ -46,6 +46,10 @@ pub const Snapshot = struct {
     /// counted once by `init` (deleted documents among them).
     dfs: []const std.StringHashMapUnmanaged(u64),
     totals: []const u64,
+    /// Per regex leaf (field, fold, pattern), the field's terms it matches
+    /// whole, found on first use by trying every term of the field.
+    matches: *std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
+    arena: Allocator,
 
     /// The snapshot of `docs`, its counts on `arena`.
     pub fn init(arena: Allocator, schema: []const Schema.Field, docs: []const Doc) Allocator.Error!Snapshot {
@@ -73,7 +77,32 @@ pub const Snapshot = struct {
                 }
             }
         }
-        return .{ .schema = schema, .docs = docs, .dfs = dfs, .totals = totals };
+        const matches = try arena.create(std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)));
+        matches.* = .empty;
+        return .{ .schema = schema, .docs = docs, .dfs = dfs, .totals = totals, .matches = matches, .arena = arena };
+    }
+
+    /// The terms of `x.field` that `x` matches whole: every term searched,
+    /// nothing pruned, what the walk's pruning must give. The pattern is
+    /// compiled once per snapshot.
+    fn matched(s: Snapshot, x: Tree.Regex) Allocator.Error!*const std.StringHashMapUnmanaged(void) {
+        const key = try std.mem.concat(s.arena, u8, &.{ &std.mem.toBytes(x.field), &.{@intFromBool(x.fold)}, x.pattern });
+        const slot = try s.matches.getOrPut(s.arena, key);
+        if (slot.found_existing) return slot.value_ptr;
+        slot.value_ptr.* = .empty;
+        var re = spectra.Regex.compile(s.arena, .init(x.pattern), query.pattern.options(x.fold)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable, // unreachable: the parser compiled it
+        };
+        defer re.deinit();
+        var c = try re.cache(s.arena);
+        defer c.deinit();
+        var it = s.dfs[x.field].keyIterator();
+        while (it.next()) |term| {
+            const found = re.find(&c, .{ .haystack = term.*, .span = .{ .start = 0, .end = term.len }, .whole = true }) catch unreachable; // unreachable: no lookaround in these patterns
+            if (found != null) try slot.value_ptr.put(s.arena, term.*, {});
+        }
+        return slot.value_ptr;
     }
 
     fn total(s: Snapshot, place: u32) u64 {
@@ -130,22 +159,10 @@ pub const Snapshot = struct {
                 .numeric => unreachable,
             },
             .regex => |x| {
-                // Every term searched whole, nothing pruned: what the walk's pruning must give.
-                var re = spectra.Regex.compile(gpa, .init(x.pattern), query.pattern.options(x.fold)) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => unreachable, // unreachable: the parser compiled it
-                };
-                defer re.deinit();
-                var c = try re.cache(gpa);
-                defer c.deinit();
-                const whole = struct {
-                    fn of(r: *const spectra.Regex, cache: *spectra.Regex.Cache, term: []const u8) bool {
-                        return (r.find(cache, .{ .haystack = term, .span = .{ .start = 0, .end = term.len }, .whole = true }) catch unreachable) != null; // unreachable: no lookaround in these patterns
-                    }
-                };
+                const terms = try s.matched(x);
                 switch (d.values[x.field]) {
-                    .text => |tokens| for (tokens) |tk| if (whole.of(&re, &c, tk.term)) return 1,
-                    .keyword => |k| if (whole.of(&re, &c, k)) return 1,
+                    .text => |tokens| for (tokens) |tk| if (terms.contains(tk.term)) return 1,
+                    .keyword => |k| if (terms.contains(k)) return 1,
                     .numeric => unreachable,
                 }
                 return null;
@@ -244,9 +261,12 @@ pub const Snapshot = struct {
     pub fn search(s: Snapshot, gpa: Allocator, root: *const Node, top: u32) Allocator.Error![]exec.Hit {
         var hits: std.ArrayList(exec.Hit) = .empty;
         defer hits.deinit(gpa);
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
         for (s.docs) |d| {
             if (d.deleted) continue;
-            if (try s.score(gpa, root, d)) |v| try hits.append(gpa, .{ .segment = d.segment, .doc = d.doc, .score = v });
+            defer _ = scratch.reset(.retain_capacity);
+            if (try s.score(scratch.allocator(), root, d)) |v| try hits.append(gpa, .{ .segment = d.segment, .doc = d.doc, .score = v });
         }
         std.mem.sort(exec.Hit, hits.items, {}, struct {
             fn lessThan(_: void, a: exec.Hit, b: exec.Hit) bool {
@@ -259,8 +279,11 @@ pub const Snapshot = struct {
 
     pub fn count(s: Snapshot, gpa: Allocator, root: *const Node) Allocator.Error!u64 {
         var n: u64 = 0;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
         for (s.docs) |d| {
-            if (!d.deleted and try s.score(gpa, root, d) != null) n += 1;
+            defer _ = scratch.reset(.retain_capacity);
+            if (!d.deleted and try s.score(scratch.allocator(), root, d) != null) n += 1;
         }
         return n;
     }
