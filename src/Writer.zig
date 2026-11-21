@@ -117,11 +117,7 @@ const Live = struct {
 /// A delete of the segment being built: `id`'s documents below `upto`.
 const BufferedDelete = struct { id: u64, upto: u32 };
 
-const File = aegis.own.OwnedIo(Io.File, closeFile);
-
-fn closeFile(f: *Io.File, io: Io) void {
-    f.close(io);
-}
+const File = aegis.own.File;
 
 gpa: Allocator,
 dir: aegis.own.Unowned(Io.Dir),

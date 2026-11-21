@@ -26,11 +26,7 @@ const Opened = @This();
 
 pub const OpenError = error{ NotFound, Corrupt, VersionTooNew, ReadFailed, Canceled, OutOfMemory };
 
-const File = aegis.own.OwnedIo(Io.File, closeFile);
-
-fn closeFile(f: *Io.File, io: Io) void {
-    f.close(io);
-}
+const File = aegis.own.File;
 
 /// The sections read whole, and those read as they are asked for.
 const whole_sections = [_]files.Section{ .terms, .lengths, .ids, .columns };
